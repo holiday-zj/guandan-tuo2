@@ -102,7 +102,7 @@ export class GameSession {
   seatNames() {
     return this.room.seats.map((id, i) => {
       if (!id) return '空位';
-      if (id.startsWith('bot:')) return '机器人' + id.slice(4);
+      if (String(id).startsWith('bot:')) return '机器人' + String(id).slice(4);
       const m = this.membersById(id);
       return m ? m.name : ('玩家' + i);
     });

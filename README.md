@@ -23,16 +23,19 @@
 ## 测试
 
 ```bash
-npm test                  # 20 个规则单元测试（牌型/比较/算级）
+npm test                  # 26 个规则单元测试（牌型/比较/算级/提示）
 npm run sim               # 100 场机器人自动对局压测（全链路无死锁）
 npm run test:e2e          # 1真人+3机器人 打完一整场（需先 npm start）
 npm run test:integration  # 4真人WS连接 建房→对战→结算→钱包守恒校验
+node test/hint-reconnect.test.js  # 出牌提示协议 + 断线重连
 ```
 
 已验证结果：
-- 单元测试 20/20 通过
+- 单元测试 26/26 通过
 - 机器人模拟 500/500 场完成，无死锁
-- 4真人集成测试：40副牌打完全场，钱包严格守恒
+- 4真人集成测试：整场打完，钱包严格守恒（总和恒为 4×初始币）
+- SQLite 持久化：重启服务端后账号/币数/战绩完整保留
+- 断线重连：重连后自动恢复当前牌局快照
 
 ## 架构
 
@@ -42,14 +45,18 @@ engine/   纯规则引擎（零依赖，可被小程序端直接引用）
   classify.js   牌型识别（含逢人配穷举）
   game.js       单副牌状态机
   match.js      整场编排（升级/进贡）
+  hint.js       出牌提示（枚举合法出法）
   driver.js     机器人对局驱动
 server/   Node.js 服务端（零第三方依赖）
   ws.js         RFC6455 WebSocket 实现
-  store.js      会员/钱包（内存版，接库即可换）
+  db.js         SQLite 持久化（会员/战绩/会话，node:sqlite）
   room.js       房间/大厅/对局会话
-  bot.js        服务端机器人
+  bot.js        服务端机器人 + 超时托管代打
   index.js      HTTP + WS 入口
-client-wechat/  微信小游戏客户端（开发中）
+client-wechat/  微信小游戏客户端
+  game.js       登录/大厅/房间/牌桌（理牌、提示、倒计时、重连）
+  js/net.js     网络层（心跳、等待助手）
+  js/card.js    Canvas 牌面渲染
 ```
 
 ### 协议
@@ -59,18 +66,26 @@ REST：`POST /api/register` `{name,password}`、`POST /api/login`、`GET /api/ro
 WebSocket：`ws://host/?token=***
 
 客户端 → 服务端：
-- `{type:'create_room', stake, botFill}` 建房
+- `{type:'create_room', stake, botFill}` 建房（stake 1-10 币/级）
 - `{type:'join_room', roomId}` 加入
 - `{type:'quick_match'}` 大厅排队
 - `{type:'start_game'}` 房主开局
 - `{type:'play', cards:[{id}]}` 出牌 / `{type:'pass'}` 过牌
-- `{type:'leave_room'}`
+- `{type:'hint'}` 请求出牌提示（返回最多8种候选）
+- `{type:'leave_room'}` / `{type:'ping'}`
 
 服务端 → 客户端：
-- `welcome / room_created / room_joined / room_state / queued`
-- `game_start {seat, snapshot}` — 初始牌局快照（只含自己的手牌）
-- `events [...]` — play/pass/finish/new_trick/round_result/next_round/match_over
+- `welcome / pong / room_created / room_joined / room_state / queued / left_room`
+- `game_start {seat, snapshot}` — 初始/重连快照（只含自己的手牌）
+- `events [...]` — play/pass/finish/auto_play/new_trick/round_result/next_round/match_over
 - `snapshot` — 每步后的最新状态
+- `hint {options}` — 提示候选
+
+### 服务端特性
+
+- **超时托管**：30秒不出牌自动代打（最小能压牌，否则过）
+- **断线重连**：掉线保留座位，重连后自动恢复牌局快照
+- **持久化**：SQLite 存会员/币数/战绩/会话，重启不丢
 
 ## 微信小游戏合规要点
 
@@ -82,13 +97,16 @@ WebSocket：`ws://host/?token=***
 
 ## 路线图
 
-- [x] 规则引擎 + 单元测试（20/20）
+- [x] 规则引擎 + 单元测试（26/26）
 - [x] 机器人自动对局压测（500场）
 - [x] 服务端：注册/登录/房间/大厅/实时对战/钱包结算
 - [x] 4真人联调通过，钱包守恒
-- [ ] 微信小游戏客户端（Canvas 渲染 + 触摸理牌 + 房间/大厅/商城界面）
-- [ ] 服务端接 MySQL/Redis 持久化（会员、战绩、房间）
+- [x] 出牌提示引擎（枚举合法出法）+ 提示协议
+- [x] SQLite 持久化（重启不丢号）
+- [x] 断线重连、超时托管（30秒代打）
+- [x] 微信小游戏客户端：理牌/提示/倒计时/选牌动画/自动登录
+- [ ] 微信开发者工具真机调试与美术资源
 - [ ] 微信支付（版号到手后接入虚拟支付）
 - [ ] 防沉迷实名认证
-- [ ] 断线重连、托管出牌、聊天/表情
-- [ ] 回放与战绩系统
+- [ ] 部署上线（备案域名 + WSS）
+- [ ] 聊天/表情、回放与战绩榜
