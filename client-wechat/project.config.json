@@ -1,0 +1,11 @@
+{
+  "description": "掼蛋（安徽拖2）小游戏",
+  "appid": "touristappid",
+  "projectname": "guandan-tuo2",
+  "setting": {
+    "es6": true,
+    "enhance": true,
+    "minified": true
+  },
+  "compileType": "game"
+}
