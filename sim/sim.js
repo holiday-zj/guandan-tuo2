@@ -1,7 +1,6 @@
-// 完整比赛模拟：验证 翻牌→定队→进贡→出牌→结算→升级 全链路
+// 完整比赛模拟：验证 发牌→亮牌定级定队→座位重排(对角)→进贡→出牌→结算 全链路（无升级，固定副数）
 import { Match } from '../engine/match.js';
 import { playRound, makeSimpleBot } from '../engine/driver.js';
-import { cardLabel } from '../engine/cards.js';
 
 const N = parseInt(process.argv[2] || '50', 10);
 let ok = 0, fails = [];
@@ -9,13 +8,20 @@ let ok = 0, fails = [];
 for (let i = 0; i < N; i++) {
   let m = null;
   try {
-    m = new Match(['东', '南', '西', '北'], { defaultTeamOf: [0, 1, 0, 1] });
+    m = new Match(['东', '南', '西', '北'], { totalRounds: 8 });
     const bots = [makeSimpleBot(), makeSimpleBot(), makeSimpleBot(), makeSimpleBot()];
     let guard = 0;
     while (!m.matchOver) {
-      if (++guard > 300) throw new Error('too many rounds (no progress?)');
+      if (++guard > 30) throw new Error('too many rounds (no progress?)');
       const { round, flipInfo, tribute } = m.newRound();
-      // 首出权：有进贡则进贡方先出，否则首局由翻到亮牌者出（简化为座位0）
+
+      // 不变量：队友必须对角（队伍0坐0/2，队伍1坐1/3）
+      const t = round.teamOf;
+      if (t[0] !== t[2] || t[1] !== t[3] || t[0] === t[1]) throw new Error('队友未对角: ' + JSON.stringify(t));
+      // 不变量：级牌由亮牌决定
+      if (!flipInfo.level) throw new Error('no level');
+
+      // 首出权：有进贡则进贡方先出，否则座位0
       let lead = 0;
       if (tribute.type === 'single' || tribute.type === 'double') lead = tribute.tributes[0].from;
       round.startPlay(lead);
@@ -28,13 +34,13 @@ for (let i = 0; i < N; i++) {
     }
     ok++;
     if (i < 3 || i === N - 1) {
-      console.log(`[match ${i + 1}] rounds=${m.roundNo} winner=${m.teamName(m.winnerTeam)} levels=${JSON.stringify(m.levels)}`);
+      console.log(`[match ${i + 1}] rounds=${m.roundNo} roundWins=${JSON.stringify(m.roundWins)} winner=${m.winnerTeam === -1 ? '平局' : '队伍' + m.winnerTeam}`);
     }
   } catch (e) {
     fails.push({ i, err: e.message });
     if (fails.length <= 2) {
       console.error(`[match ${i + 1}] FAIL: ${e.message}`);
-      const r = m.round;
+      const r = m && m.round;
       if (r) console.error('  finishOrder=', JSON.stringify(r.finishOrder), 'state=', r.state, 'hands=', r.hands.map(h => h && h.length));
     }
   }

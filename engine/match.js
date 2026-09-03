@@ -1,16 +1,7 @@
-// 整局比赛（多副牌，2→A）流程编排：翻牌定级定队、进贡/还贡/抗贡、升级
+// 整场比赛编排（多副牌，无升级）
+// 每副牌独立：亮牌决定本副打几、拖几、谁和谁一队（持亮相牌者结队并坐对角）
 import { Round } from './game.js';
-import { RANKS, RANK_ORDER } from './cards.js';
-
-// 级数序列表：2,3,…,K,A,过A(A+)
-export const LEVEL_SEQ = [...RANKS, 'A+'];
-
-export function nextLevel(level, steps) {
-  let i = LEVEL_SEQ.indexOf(level);
-  if (i < 0) i = 0;
-  const j = Math.min(i + steps, LEVEL_SEQ.length - 1);
-  return LEVEL_SEQ[j];
-}
+import { RANK_ORDER } from './cards.js';
 
 // 进贡牌：手中除红桃级牌外的最大牌（红桃级牌不可进贡）
 export function pickTributeCard(hand, level) {
@@ -23,63 +14,79 @@ export function pickTributeCard(hand, level) {
   return best ? best.card : null;
 }
 
+// 座位重排：给定各旧座位的队伍归属，返回 perm（perm[新座位] = 旧座位），
+// 使队伍0坐 0/2（对角）、队伍1坐 1/3（对角）。若已对角则不动任何人。
+export function seatPermutation(teamOf) {
+  const t0 = [0, 1, 2, 3].filter(s => teamOf[s] === 0);
+  const t1 = [0, 1, 2, 3].filter(s => teamOf[s] === 1);
+  const diag = (a, b) => Math.abs(a - b) === 2;
+  if (diag(t0[0], t0[1])) return [0, 1, 2, 3]; // 已对角，全员不动
+  // 需重排：队伍0对角坐 0/2（已在 0/2 位的成员不动），队伍1坐 1/3
+  const anchor0 = t0.find(s => s === 0 || s === 2) ?? t0[0];
+  const other0 = t0.find(s => s !== anchor0);
+  const anchor1 = t1.find(s => s === 1 || s === 3) ?? t1[0];
+  const other1 = t1.find(s => s !== anchor1);
+  return [anchor0, anchor1, other0, other1]; // 新座位 0,1,2,3 分别由谁入座
+}
+
 export class Match {
-  constructor(seatNames, opts = {}) {
-    this.seatNames = seatNames;           // ['P0','P1','P2','P3']
+  // occupants: 初始座位上的玩家标识（memberId 或 'bot:N'），长度4
+  constructor(occupants, opts = {}) {
+    this.occupants = occupants.slice();   // 当前引擎座位序（每副牌可能重排）
     this.rng = opts.rng || Math.random;
-    this.defaultTeamOf = opts.defaultTeamOf || [0, 1, 0, 1]; // 首局队伍：0/2 vs 1/3
-    this.levels = [null, null];           // [队伍0级数, 队伍1级数]，null 表示未开始
+    this.totalRounds = opts.totalRounds || 8; // 一场打几副
     this.roundNo = 0;
     this.history = [];
-    this.lastResult = null;               // 上一副牌结算
+    this.lastResult = null;
+    this.lastTeamOf = null;
     this.round = null;
     this.matchOver = false;
-    this.winnerTeam = null;
+    this.winnerTeam = null;               // -1 表示平局
+    this.roundWins = [0, 0];              // 各队赢的副数
+    this.netLevels = [0, 0];              // 各队累计级数差（仅供展示/平局参考）
   }
 
-  teamName(t) { return t === 0 ? `${this.seatNames[0]}/${this.seatNames[2]}` : `${this.seatNames[1]}/${this.seatNames[3]}`; }
-
-  // 开始新一副牌：发牌 + 亮牌
+  // 开始新一副牌：发牌 → 亮牌定级定队 → 重排座位（队友对角）→ 进贡
   newRound() {
     this.roundNo++;
-    const prevTeamOf = this.round ? this.round.teamOf : null;
-    const r = new Round(this.seatNames, this.lastRoundTeam(), this.rng);
+    const r = new Round(this.occupants, [0, 1, 0, 1], this.rng);
     r.deal();
-    const flipInfo = r.flip();
+    const info = r.flip(); // 纯计算：亮牌、级别、拖、队伍归属（按旧座位）
+
+    // —— 重排座位：队友必须对角 ——
+    const oldOccupants = this.occupants.slice();
+    const perm = seatPermutation(info.teamOf);
+    r.hands = perm.map(old => r.hands[old]);
+    this.occupants = perm.map(old => oldOccupants[old]);
+    r.applyFlip({ ...info, teamOf: [0, 1, 0, 1] });
     this.round = r;
 
-    // 进贡判定（首副无贡）
-    let tributes = [];
+    // —— 进贡（上一副输家向赢家进贡；首副无贡）——
     let tribute = { type: 'none' };
     if (this.lastResult) {
-      const { losers, winners, ranking } = this.lastResult;
-      const doubleDown = prevTeamOf && prevTeamOf[ranking.second] === prevTeamOf[ranking.first];
-      const antiTribute = this.checkAntiTribute(r, losers);
-      if (antiTribute) {
+      const { ranking, losers } = this.lastResult;
+      const toNew = oldSeat => this.occupants.indexOf(oldOccupants[oldSeat]);
+      const doubleDown = this.lastTeamOf && this.lastTeamOf[ranking.second] === this.lastTeamOf[ranking.first];
+      const newLosers = losers.map(toNew);
+      if (this.checkAntiTribute(r, newLosers)) {
         tribute = { type: 'anti' };
       } else if (doubleDown) {
-        // 双贡：两输家各进一张最大牌给两赢家（交叉：三游→头游，末游→二游）
-        const g1 = pickTributeCard(r.hands[ranking.third], r.level);
-        const g2 = pickTributeCard(r.hands[ranking.fourth], r.level);
-        tributes = [
-          { from: ranking.third, to: ranking.first, card: g1 },
-          { from: ranking.fourth, to: ranking.second, card: g2 },
+        // 双贡：三游→头游，末游→二游
+        const tributes = [
+          { from: toNew(ranking.third), to: toNew(ranking.first), card: pickTributeCard(r.hands[toNew(ranking.third)], r.level) },
+          { from: toNew(ranking.fourth), to: toNew(ranking.second), card: pickTributeCard(r.hands[toNew(ranking.fourth)], r.level) },
         ];
+        r.applyTributes(tributes.filter(t => t.card));
         tribute = { type: 'double', tributes };
       } else {
-        // 单贡：末游向头游进贡
-        const g = pickTributeCard(r.hands[ranking.fourth], r.level);
-        tributes = [{ from: ranking.fourth, to: ranking.first, card: g }];
+        // 单贡：末游→头游
+        const tributes = [{ from: toNew(ranking.fourth), to: toNew(ranking.first), card: pickTributeCard(r.hands[toNew(ranking.fourth)], r.level) }];
+        r.applyTributes(tributes.filter(t => t.card));
         tribute = { type: 'single', tributes };
       }
     }
     r.tributeInfo = tribute;
-    if (tributes.length) r.applyTributes(tributes.filter(t => t.card));
-    return { round: r, flipInfo, tribute };
-  }
-
-  lastRoundTeam() {
-    return this.round ? this.round.teamOf : this.defaultTeamOf;
+    return { round: r, flipInfo: info, tribute, perm };
   }
 
   checkAntiTribute(round, losers) {
@@ -89,18 +96,19 @@ export class Match {
     return bj >= 2;
   }
 
-  // 提交本副牌结算，升级
+  // 本副结算入账（不升级，只记副数与级数差）
   applyResult(result) {
-    const t = result.winTeam;
-    if (this.levels[t] === null) this.levels[t] = '2';
-    if (this.levels[1 - t] === null) this.levels[1 - t] = '2';
-    const before = this.levels[t];
-    this.levels[t] = nextLevel(before, result.total);
-    this.lastResult = { ...result, roundNo: this.roundNo, doubleDown: result.base === 3 };
+    this.roundWins[result.winTeam]++;
+    this.netLevels[result.winTeam] += result.total;
+    this.netLevels[1 - result.winTeam] -= result.total;
+    this.lastTeamOf = this.round.teamOf.slice();
+    this.lastResult = { ...result, roundNo: this.roundNo };
     this.history.push({ roundNo: this.roundNo, level: this.round.level, result: this.lastResult });
-    if (this.levels[t] === 'A+') {
+    if (this.roundNo >= this.totalRounds) {
       this.matchOver = true;
-      this.winnerTeam = t;
+      this.winnerTeam = this.roundWins[0] === this.roundWins[1]
+        ? -1
+        : (this.roundWins[0] > this.roundWins[1] ? 0 : 1);
     }
     return this.lastResult;
   }
@@ -108,7 +116,8 @@ export class Match {
   status() {
     return {
       roundNo: this.roundNo,
-      levels: this.levels,
+      totalRounds: this.totalRounds,
+      roundWins: this.roundWins.slice(),
       teamOf: this.round ? this.round.teamOf : null,
       level: this.round ? this.round.level : null,
       matchOver: this.matchOver,

@@ -140,8 +140,8 @@ async function main() {
     const snapMsg = c.latest(m => m.type === 'snapshot' || m.type === 'game_start');
     const snap = snapMsg.snapshot;
 
-    if (snap.turn === seat) {
-      const act = decide(snap, seat);
+    if (snap.turn === snap.mySeat) {
+      const act = decide(snap, snap.mySeat);
       c.send(act);
       actions++;
       // 等待服务端回推新快照（机器人已同步驱动完毕）

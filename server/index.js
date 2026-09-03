@@ -2,7 +2,13 @@
 // 特性：SQLite 持久化、出牌提示、断线重连、超时托管
 // 启动：node server/index.js  （默认端口 8080）
 import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { acceptKey, parseFrames, encodeFrame, OP } from './ws.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const WEB_DIR = path.join(__dirname, '..', 'web');
 import { store, loadMember, settleCoins, publicProfile, memberCache } from './db.js';
 import { Lobby, GameSession } from './room.js';
 import { botDecide } from './bot.js';
@@ -32,6 +38,21 @@ const server = http.createServer((req, res) => {
       'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
       'Sec-WebSocket-Accept: ' + acceptKey(key) + '\r\n\r\n');
     attachWs(req.socket, member);
+    return;
+  }
+
+  // 静态网页版试玩客户端
+  if (url.pathname === '/' || url.pathname.startsWith('/web/')) {
+    const rel = url.pathname === '/' ? 'index.html' : url.pathname.slice('/web/'.length);
+    const file = path.normalize(path.join(WEB_DIR, rel));
+    if (file.startsWith(WEB_DIR) && fs.existsSync(file) && fs.statSync(file).isFile()) {
+      const ext = path.extname(file);
+      const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png' };
+      res.writeHead(200, { 'Content-Type': types[ext] || 'application/octet-stream' });
+      fs.createReadStream(file).pipe(res);
+      return;
+    }
+    res.writeHead(404); res.end('not found');
     return;
   }
 
@@ -92,10 +113,10 @@ function attachWs(socket, member) {
     const session = sessions.get(rec.roomId);
     const room = lobby.rooms.get(rec.roomId);
     if (session && room && room.state === 'playing') {
-      ws.send({ type: 'room_joined', roomId: rec.roomId, seat: rec.seat, reconnect: true });
-      ws.send({ type: 'game_start', seat: rec.seat, snapshot: session.snapshotFor(rec.seat), reconnect: true });
-      const snap = session.snapshotFor(rec.seat);
-      ws.send({ type: 'snapshot', snapshot: snap });
+      const seat = session.engineSeat(member.id);
+      ws.send({ type: 'room_joined', roomId: rec.roomId, seat, reconnect: true });
+      ws.send({ type: 'game_start', seat, snapshot: session.snapshotFor(member.id), reconnect: true });
+      ws.send({ type: 'snapshot', snapshot: session.snapshotFor(member.id) });
     } else if (room && room.state === 'waiting') {
       ws.send({ type: 'room_joined', roomId: rec.roomId, seat: rec.seat, reconnect: true });
       broadcastRoom(rec.roomId);
@@ -138,6 +159,7 @@ function handleMsg(member, msg) {
     case 'create_room': {
       const room = lobby.createPrivateRoom(member.id, {
         stake: Math.max(1, Math.min(10, msg.stake || 1)),
+        rounds: Math.max(1, Math.min(16, msg.rounds || 8)),
         botFill: !!msg.botFill,
       });
       c.roomId = room.id; c.seat = 0;
@@ -174,7 +196,8 @@ function handleMsg(member, msg) {
     case 'hint': {
       const session = sessions.get(c.roomId);
       if (!session) { ws.send({ type: 'error', error: '不在对局中' }); break; }
-      const seat = c.seat;
+      const seat = session.engineSeat(member.id);
+      if (seat < 0) { ws.send({ type: 'error', error: '不在本局中' }); break; }
       const r = session.match.round;
       if (r.state !== 'playing' || session.driver.turn !== seat) { ws.send({ type: 'error', error: '未到你的回合' }); break; }
       let opts;
@@ -192,7 +215,8 @@ function handleMsg(member, msg) {
       if (!room || room.state !== 'playing') { ws.send({ type: 'error', error: '对局未开始' }); break; }
       const session = sessions.get(c.roomId);
       if (!session) break;
-      const seat = c.seat;
+      const seat = session.engineSeat(member.id);
+      if (seat < 0) { ws.send({ type: 'error', error: '不在本局中' }); break; }
       const action = msg.type === 'pass' ? { type: 'pass' } : { type: 'play', cards: msg.cards || [] };
       const res = session.handleAction(seat, action);
       if (!res.ok) { ws.send({ type: 'error', error: res.error }); break; }
@@ -233,7 +257,7 @@ function autoPlay(roomId) {
   const r = session.match.round;
   if (r.state !== 'playing') return;
   const seat = session.driver.turn;
-  const occupant = room.seats[seat];
+  const occupant = session.match.occupants[seat];
   if (occupant && String(occupant).startsWith('bot:')) return; // 机器人由 driveBots 处理
 
   // 代打：能压就出最小的，否则过
@@ -274,12 +298,11 @@ function maybeStart(roomId, force = false) {
   room.state = 'playing';
   const botEvents = session.driveBots(); // 首出者是机器人时自动推进
 
-  // 给每个真人推初始快照
-  for (let seat = 0; seat < 4; seat++) {
-    const id = room.seats[seat];
+  // 给每个真人推初始快照（按玩家身份定位，座位可能已被亮牌重排）
+  for (const id of room.seats) {
     if (id && !String(id).startsWith('bot:')) {
       const cc = clients.get(id);
-      if (cc && cc.ws) cc.ws.send({ type: 'game_start', seat, snapshot: session.snapshotFor(seat) });
+      if (cc && cc.ws) cc.ws.send({ type: 'game_start', seat: session.engineSeat(id), snapshot: session.snapshotFor(id) });
     }
   }
   if (botEvents.length) pushEvents(roomId, botEvents);
@@ -295,14 +318,13 @@ function pushEvents(roomId, events) {
     if (ev.type === 'match_over') finishMatch(session);
   }
   broadcast(roomId, { type: 'events', events });
-  // 推送最新快照给每位真人
+  // 推送最新快照给每位真人（按玩家身份定位）
   const room = lobby.rooms.get(roomId);
   if (room) {
-    for (let seat = 0; seat < 4; seat++) {
-      const id = room.seats[seat];
+    for (const id of room.seats) {
       if (id && !String(id).startsWith('bot:')) {
         const cc = clients.get(id);
-        if (cc && cc.ws) cc.ws.send({ type: 'snapshot', snapshot: session.snapshotFor(seat) });
+        if (cc && cc.ws) cc.ws.send({ type: 'snapshot', snapshot: session.snapshotFor(id) });
       }
     }
   }
@@ -312,8 +334,9 @@ function settleWallet(session, result) {
   const room = session.room;
   const stake = room.stake || 1;
   const amount = result.total * stake;
-  const winnerIds = result.winners.map(s => room.seats[s]).filter(id => id && !String(id).startsWith('bot:'));
-  const loserIds = result.losers.map(s => room.seats[s]).filter(id => id && !String(id).startsWith('bot:'));
+  const occupants = session.match.occupants; // 引擎座位 → 玩家身份（重排后）
+  const winnerIds = result.winners.map(s => occupants[s]).filter(id => id && !String(id).startsWith('bot:'));
+  const loserIds = result.losers.map(s => occupants[s]).filter(id => id && !String(id).startsWith('bot:'));
   settleCoins(winnerIds, loserIds, amount);
   for (const id of [...winnerIds, ...loserIds]) {
     const m = loadMember(id);
@@ -324,7 +347,7 @@ function settleWallet(session, result) {
 function finishMatch(session) {
   clearTimeout(turnTimers.get(session.room.id));
   store.logMatch(session.winnerTeam, session.match.roundNo, {
-    levels: session.match.levels,
+    roundWins: session.match.roundWins,
   });
   for (const id of session.room.seats) {
     if (id && !String(id).startsWith('bot:')) {

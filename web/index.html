@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>掼蛋 · 拖2（安徽玩法）</title>
+<style>
+  html,body{margin:0;padding:0;background:#0b3d20;height:100%;overflow:hidden;font-family:"PingFang SC","Microsoft YaHei",sans-serif}
+  #cv{display:block;margin:0 auto;touch-action:none}
+  #tip{position:fixed;bottom:6px;width:100%;text-align:center;color:rgba(255,255,255,.45);font-size:12px}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div id="tip">掼蛋·拖2 试玩版 — 亮牌定队 · 拖2结算 · 出牌提示</div>
+<script>
+'use strict';
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+let W = 1280, H = 720;
+function fit(){
+  const r = Math.min(window.innerWidth/1280, window.innerHeight/720);
+  W = 1280; H = 720;
+  cv.width = W; cv.height = H;
+  cv.style.width = (1280*r)+'px'; cv.style.height = (720*r)+'px';
+  scale = r;
+}
+let scale = 1;
+window.addEventListener('resize', fit); fit();
+
+const RANK_ORDER = {'2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'T':10,'J':11,'Q':12,'K':13,'A':14};
+const SUIT_COLOR = {'♠':'#1a1a2e','♥':'#c62828','♣':'#1a1a2e','♦':'#c62828'};
+
+// —— 网络 ——
+const api = {
+  token:null, profile:null, ws:null, handlers:{}, waiters:[],
+  async post(path, data){
+    const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)});
+    return r.json();
+  },
+  on(t,fn){ (this.handlers[t]=this.handlers[t]||[]).push(fn); },
+  wait(t,ms=8000){
+    return new Promise((res,rej)=>{
+      const timer = setTimeout(()=>{ this.waiters=this.waiters.filter(w=>w.timer!==timer); rej(new Error('timeout '+t)); }, ms);
+      this.waiters.push({t,res,timer});
+    });
+  },
+  dispatch(d){
+    for(const w of this.waiters.slice()) if(w.t===d.type){ clearTimeout(w.timer); this.waiters=this.waiters.filter(x=>x!==w); w.res(d); }
+    (this.handlers[d.type]||[]).forEach(f=>f(d));
+  },
+  connect(){
+    return new Promise((res,rej)=>{
+      const proto = location.protocol==='https:'?'wss':'ws';
+      this.ws = new WebSocket(`${proto}://${location.host}/?token=${this.token}`);
+      this.ws.onopen = ()=>res();
+      this.ws.onerror = e=>rej(e);
+      this.ws.onclose = ()=>toast('连接断开');
+      this.ws.onmessage = m=>{ try{ this.dispatch(JSON.parse(m.data)); }catch{} };
+    });
+  },
+  send(o){ if(this.ws && this.ws.readyState===1) this.ws.send(JSON.stringify(o)); },
+};
+
+// —— 状态 ——
+const ui = { scene:'login', mySeat:null, snap:null, roomId:null, roomState:null,
+  selected:new Set(), buttons:[], cardRects:[], toast:null, deadline:null,
+  hintOpts:[], hintIdx:0, teamIdx:0 };
+const TURN_MS = 30000;
+
+function toast(t, ms=2200){ ui.toast = {t, until: Date.now()+ms}; }
+function label(c){ if(c.suit==='X') return c.rank==='BJ'?'大王':'小王'; return c.suit+({T:'10'}[c.rank]||c.rank); }
+function val(c, lv){ return c.rank==='BJ'?17 : c.rank==='SJ'?16 : c.rank===lv?15 : RANK_ORDER[c.rank]; }
+function sortHand(h, lv){ return h.slice().sort((a,b)=> val(a,lv)-val(b,lv) || a.suit.localeCompare(b.suit)); }
+
+// —— 绘制基础 ——
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+function btn(text,x,y,w,h,fn,color='#2e7d32'){
+  ctx.fillStyle=color; rr(x,y,w,h,12); ctx.fill();
+  ctx.fillStyle='#fff'; ctx.font='bold 26px sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText(text,x+w/2,y+h/2+2); ctx.textBaseline='alphabetic';
+  ui.buttons.push({x,y,w,h,fn});
+}
+function drawCard(c,x,y,w,h,o={}){
+  const oy = o.sel?-20:0;
+  ctx.save(); ctx.shadowColor='rgba(0,0,0,.3)'; ctx.shadowBlur=5; ctx.shadowOffsetY=2;
+  rr(x,y+oy,w,h,7); ctx.fillStyle = o.back?'#33568c':'#fffef5'; ctx.fill(); ctx.restore();
+  rr(x,y+oy,w,h,7); ctx.lineWidth = o.sel?3:1.2; ctx.strokeStyle = o.sel?'#ffd54f':(o.hl?'#4fc3f7':'#999'); ctx.stroke();
+  if(o.back){ ctx.fillStyle='rgba(255,255,255,.12)'; rr(x+w*.18,y+oy+h*.14,w*.64,h*.72,5); ctx.fill(); return; }
+  if(c.suit==='X'){
+    ctx.fillStyle = c.rank==='BJ'?'#c62828':'#37474f';
+    ctx.font='bold '+Math.floor(h*.24)+'px sans-serif'; ctx.textAlign='center';
+    ctx.fillText(c.rank==='BJ'?'大':'小', x+w/2, y+oy+h*.38);
+    ctx.font=Math.floor(h*.2)+'px sans-serif'; ctx.fillText('王', x+w/2, y+oy+h*.62);
+    return;
+  }
+  const col = SUIT_COLOR[c.suit];
+  ctx.fillStyle=col; ctx.textAlign='left';
+  ctx.font='bold '+Math.floor(h*.24)+'px sans-serif';
+  ctx.fillText({T:'10'}[c.rank]||c.rank, x+5, y+oy+h*.26);
+  ctx.font=Math.floor(h*.2)+'px sans-serif';
+  ctx.fillText(c.suit, x+5, y+oy+h*.48);
+  ctx.globalAlpha=.22; ctx.font=Math.floor(h*.4)+'px sans-serif'; ctx.textAlign='center';
+  ctx.fillText(c.suit, x+w*.68, y+oy+h*.8); ctx.globalAlpha=1;
+  if(o.wild){ ctx.fillStyle='#ff8f00'; ctx.font='bold '+Math.floor(h*.17)+'px sans-serif'; ctx.textAlign='right'; ctx.fillText('配',x+w-4,y+oy+h-5); }
+}
+
+// —— 场景渲染 ——
+function render(){
+  ctx.clearRect(0,0,W,H); ui.buttons=[];
+  ({login:renderLogin, lobby:renderLobby, room:renderRoom, game:renderGame}[ui.scene]||renderLogin)();
+  if(ui.toast && Date.now()<ui.toast.until){
+    ctx.fillStyle='rgba(0,0,0,.78)'; rr(W/2-270,54,540,58,12); ctx.fill();
+    ctx.fillStyle='#fff'; ctx.font='26px sans-serif'; ctx.textAlign='center'; ctx.fillText(ui.toast.t, W/2, 92);
+  }
+  requestAnimationFrame(render);
+}
+function renderLogin(){
+  bg();
+  ctx.fillStyle='#ffd54f'; ctx.font='bold 68px sans-serif'; ctx.textAlign='center'; ctx.fillText('掼蛋 · 拖2', W/2, 220);
+  ctx.fillStyle='rgba(255,255,255,.6)'; ctx.font='24px sans-serif';
+  ctx.fillText('安徽玩法 · 亮牌定队 · 拖2结算', W/2, 268);
+  btn('游客快速开始', W/2-180, 360, 360, 88, doLogin, '#2e7d32');
+  ctx.fillStyle='rgba(255,255,255,.4)'; ctx.font='20px sans-serif';
+  ctx.fillText('首次进入自动注册账号', W/2, 490);
+}
+async function doLogin(){
+  const name = localStorage.getItem('gd_name') || '试玩' + Math.floor(Math.random()*100000);
+  try{
+    let r = await api.post('/api/login',{name,password:'guest'});
+    if(!r.ok) r = await api.post('/api/register',{name,password:'guest'});
+    if(!r.ok) return toast(r.error||'登录失败');
+    api.token=r.token; api.profile=r.profile;
+    localStorage.setItem('gd_name',name); localStorage.setItem('gd_token',r.token);
+    await api.connect();
+    ui.scene='lobby';
+  }catch(e){ toast('连接服务器失败'); }
+}
+function bg(){ const g=ctx.createLinearGradient(0,0,0,H); g.addColorStop(0,'#0f4a2a'); g.addColorStop(1,'#0a3420'); ctx.fillStyle=g; ctx.fillRect(0,0,W,H); }
+function renderLobby(){
+  bg();
+  const p = api.profile||{};
+  ctx.fillStyle='#fff'; ctx.font='28px sans-serif'; ctx.textAlign='left'; ctx.fillText(p.name||'', 36, 52);
+  ctx.fillStyle='#ffd54f'; ctx.textAlign='right'; ctx.fillText('游戏币 '+(p.coins??0), W-36, 52);
+  ctx.fillStyle='rgba(255,255,255,.07)'; rr(W/2-440,130,880,430,24); ctx.fill();
+  btn('人机练习（推荐先玩）', W/2-220, 200, 440, 96, async ()=>{
+    api.send({type:'create_room', stake:1, botFill:true});
+    try{ const d = await api.wait('room_created'); ui.roomId=d.roomId; ui.scene='room'; api.send({type:'start_game'}); }catch{}
+  }, '#6a4c93');
+  btn('创建房间（等朋友加入）', W/2-220, 330, 440, 96, async ()=>{
+    api.send({type:'create_room', stake:1, botFill:false});
+    try{ const d = await api.wait('room_created'); ui.roomId=d.roomId; ui.scene='room'; }catch{}
+  }, '#1565c0');
+  btn('快速匹配', W/2-220, 460, 440, 96, ()=>{ api.send({type:'quick_match'}); toast('已进入匹配队列…'); }, '#2e7d32');
+  const st = p.stats||{};
+  ctx.fillStyle='rgba(255,255,255,.5)'; ctx.font='22px sans-serif'; ctx.textAlign='center';
+  ctx.fillText(`战绩：${st.wins||0} 胜 / ${st.matches||0} 场 · ${st.rounds||0} 副`, W/2, 600);
+}
+function renderRoom(){
+  bg();
+  ctx.fillStyle='#fff'; ctx.font='bold 36px sans-serif'; ctx.textAlign='center';
+  ctx.fillText('房间 '+ui.roomId, W/2, 90);
+  const seats = ui.roomState?ui.roomState.seats:['-','-','-','-'];
+  const pos = [{x:W/2,y:470},{x:W*0.78,y:300},{x:W/2,y:180},{x:W*0.22,y:300}];
+  for(let i=0;i<4;i++){
+    const {x,y}=pos[i]; const occ = seats[i] && seats[i]!=='（空位）';
+    ctx.fillStyle = occ?'rgba(255,255,255,.22)':'rgba(0,0,0,.3)';
+    ctx.beginPath(); ctx.arc(x,y,44,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#fff'; ctx.font='22px sans-serif'; ctx.textAlign='center';
+    ctx.fillText(occ?seats[i]:'等待加入…', x, y+76);
+  }
+  ctx.fillStyle='rgba(255,255,255,.55)'; ctx.font='22px sans-serif';
+  ctx.fillText('底注：每级 '+(ui.roomState?ui.roomState.stake:1)+' 币', W/2, 570);
+  btn('开始游戏', W/2-150, 610, 300, 76, ()=>api.send({type:'start_game'}));
+}
+function renderGame(){
+  ctx.fillStyle='#0d5c33'; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#0a4a29'; rr(110,86,W-220,H-300,44); ctx.fill();
+  const s = ui.snap; if(!s) return;
+  // 顶栏
+  ctx.fillStyle='rgba(0,0,0,.4)'; ctx.fillRect(0,0,W,50);
+  ctx.fillStyle='#fff'; ctx.font='24px sans-serif'; ctx.textAlign='left';
+  ctx.fillText(`第${s.roundNum}/${s.totalRounds}副  打${s.level}  拖${s.tug}  亮${s.flip||''}`, 24, 34);
+  ctx.textAlign='right';
+  ctx.fillText(`比分 ${s.roundWins[ui.teamIdx]} : ${s.roundWins[1-ui.teamIdx]}`, W-24, 34);
+  // 三家
+  const rel = [1,2,3].map(r=>(ui.mySeat+r)%4);
+  const pos = [{x:W-120,y:H*0.36},{x:W/2,y:100},{x:120,y:H*0.36}];
+  rel.forEach((seat,i)=>{
+    const {x,y}=pos[i];
+    const partner = s.teamOf[seat]===s.teamOf[ui.mySeat];
+    const fin = s.finishOrder.includes(seat);
+    drawCard({},x-30,y,60,84,{back:true});
+    ctx.fillStyle = fin?'#81c784':(partner?'#ffd54f':'#fff');
+    ctx.font='21px sans-serif'; ctx.textAlign='center';
+    ctx.fillText((fin?'✓ ':'')+s.names[seat]+(partner?'(队友)':'')+' '+s.handCounts[seat]+'张', x, y+112);
+    if(s.turn===seat && !fin){ ctx.fillStyle='#ffd54f'; ctx.fillText('▶ 思考中', x, y+140); }
+  });
+  // 桌面牌
+  if(s.best){
+    const txt = s.names[s.best.by]+'：'+s.best.cards.map(label).join(' ');
+    ctx.fillStyle='rgba(0,0,0,.45)'; rr(W/2-280,H*0.33,560,54,12); ctx.fill();
+    ctx.fillStyle='#fff'; ctx.font='28px sans-serif'; ctx.textAlign='center'; ctx.fillText(txt, W/2, H*0.33+37);
+  }
+  // 倒计时
+  if(s.turn===ui.mySeat && ui.deadline){
+    const remain = Math.max(0, ui.deadline-Date.now()), pct = remain/TURN_MS;
+    ctx.fillStyle='rgba(0,0,0,.4)'; rr(W/2-200,H*0.46,400,16,8); ctx.fill();
+    ctx.fillStyle = pct>.3?'#66bb6a':'#ef5350'; rr(W/2-200,H*0.46,Math.max(8,400*pct),16,8); ctx.fill();
+    ctx.fillStyle='#fff'; ctx.font='20px sans-serif'; ctx.textAlign='center'; ctx.fillText(Math.ceil(remain/1000)+'秒', W/2, H*0.46+46);
+  }
+  // 手牌
+  const hand = sortHand(s.hand, s.level);
+  const n = hand.length, cw=84, ch=118;
+  const gap = n>1?Math.min(40,(W-140-cw)/(n-1)):0;
+  const startX = (W-(cw+gap*(n-1)))/2, baseY = H-ch-22;
+  ui.cardRects=[];
+  hand.forEach((c,i)=>{
+    const x = startX+i*gap;
+    const sel = ui.selected.has(c.id);
+    const wild = c.suit==='♥'&&c.rank===s.level;
+    const hl = ui.hintOpts[ui.hintIdx] && ui.hintOpts[ui.hintIdx].some(h=>h.id===c.id);
+    drawCard(c,x,baseY,cw,ch,{sel,wild,hl});
+    ui.cardRects.push({x,y:baseY-(sel?20:0),w:cw,h:ch,id:c.id});
+  });
+  const myTurn = s.turn===ui.mySeat && !s.finishOrder.includes(ui.mySeat);
+  if(myTurn){
+    btn('提示', W*0.18-80, H*0.56, 160, 70, doHint, '#455a64');
+    btn('出牌', W*0.5-80, H*0.56, 160, 70, doPlay);
+    if(s.best) btn('过', W*0.82-80, H*0.56, 160, 70, ()=>{ api.send({type:'pass'}); ui.selected.clear(); ui.hintOpts=[]; }, '#757575');
+  } else if(s.finishOrder.includes(ui.mySeat)){
+    ctx.fillStyle='#ffd54f'; ctx.font='bold 32px sans-serif'; ctx.textAlign='center';
+    ctx.fillText(['头游!','二游!','三游','末游'][s.finishOrder.indexOf(ui.mySeat)], W/2, H*0.58);
+  }
+}
+async function doHint(){
+  api.send({type:'hint'});
+  try{
+    const d = await api.wait('hint',3000);
+    if(!d.options.length) return toast('没有能压的牌，建议过');
+    ui.hintOpts = d.options;
+    ui.hintIdx = (ui.hintIdx+1)%ui.hintOpts.length;
+    ui.selected = new Set(ui.hintOpts[ui.hintIdx].map(c=>c.id));
+  }catch{ toast('暂时无提示'); }
+}
+function doPlay(){
+  const cards=[...ui.selected].map(id=>({id}));
+  if(!cards.length) return toast('请先选牌或点提示');
+  api.send({type:'play',cards});
+}
+
+// —— 输入 ——
+function toCanvas(e){
+  const r = cv.getBoundingClientRect();
+  const p = e.changedTouches?e.changedTouches[0]:e;
+  return { x:(p.clientX-r.left)/r.width*W, y:(p.clientY-r.top)/r.height*H };
+}
+function onTap(e){
+  const {x,y} = toCanvas(e);
+  for(const b of ui.buttons) if(x>=b.x&&x<=b.x+b.w&&y>=b.y&&y<=b.y+b.h) return b.fn();
+  if(ui.scene==='game'){
+    for(let i=ui.cardRects.length-1;i>=0;i--){
+      const r = ui.cardRects[i];
+      if(x>=r.x&&x<=r.x+r.w&&y>=r.y&&y<=r.y+r.h){
+        ui.selected.has(r.id)?ui.selected.delete(r.id):ui.selected.add(r.id);
+        ui.hintOpts=[];
+        return;
+      }
+    }
+  }
+}
+cv.addEventListener('click', onTap);
+cv.addEventListener('touchend', e=>{ e.preventDefault(); onTap(e); });
+
+// —— 网络事件 ——
+api.on('welcome', d=>{ api.profile=d.profile; });
+api.on('room_state', d=>{ ui.roomState=d; });
+api.on('queued', d=>toast(`排队中，第${d.position}位（共${d.waiting}人）`));
+api.on('game_start', d=>{
+  ui.mySeat = d.snapshot.mySeat ?? d.seat; ui.snap=d.snapshot; ui.teamIdx=d.snapshot.teamOf[ui.mySeat];
+  ui.scene='game'; ui.selected.clear(); ui.hintOpts=[]; setTimer(d.snapshot);
+  if(!d.reconnect) toast(`对局开始！亮${d.snapshot.flip} 打${d.snapshot.level}`, 3000);
+});
+api.on('snapshot', d=>{ ui.snap=d.snapshot; setTimer(d.snapshot); });
+api.on('events', d=>{
+  for(const ev of d.events){
+    if(ev.type==='finish' && ui.snap) toast(`${ui.snap.names[ev.seat]}第${ev.rank}个出完`,1400);
+    if(ev.type==='auto_play') toast('超时，系统已代出',1400);
+    if(ev.type==='round_result'){
+      const r=ev.result, win=r.winners.includes(ui.mySeat), stake=ui.roomState?ui.roomState.stake:1;
+      toast(`本副：${r.base}基础+${r.tugBonus}拖+${r.leftover}剩=${r.total}级 ${win?'+':'-'}${r.total*stake}币`, 4000);
+      ui.selected.clear(); ui.hintOpts=[];
+    }
+    if(ev.type==='match_over'){
+      toast(ui.teamIdx===ev.winnerTeam?'🎉 你们赢了整场！':'整场结束，对方获胜', 5000);
+      setTimeout(()=>{ ui.scene='lobby'; ui.snap=null; ui.roomId=null; refresh(); }, 4500);
+    }
+  }
+});
+api.on('error', d=>toast(d.error));
+function setTimer(s){ ui.deadline = (s && s.turn===ui.mySeat) ? (ui.deadline||Date.now()+TURN_MS) : null; }
+async function refresh(){
+  const name = localStorage.getItem('gd_name'); if(!name) return;
+  try{ const r = await api.post('/api/login',{name,password:'guest'}); if(r.ok){ api.profile=r.profile; api.token=r.token; } }catch{}
+}
+
+// —— 启动 ——
+(async ()=>{
+  requestAnimationFrame(render);
+  const token = localStorage.getItem('gd_token'), name = localStorage.getItem('gd_name');
+  if(token && name){
+    try{
+      const r = await api.post('/api/login',{name,password:'guest'});
+      if(r.ok){ api.token=r.token; api.profile=r.profile; await api.connect(); ui.scene='lobby'; return; }
+    }catch{}
+  }
+})();
+</script>
+</body>
+</html>

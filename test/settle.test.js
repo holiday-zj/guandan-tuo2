@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Round } from '../engine/game.js';
-import { nextLevel } from '../engine/match.js';
+import { seatPermutation } from '../engine/match.js';
 
 const C = (suit, rank) => ({ id: suit + rank, suit, rank });
 
@@ -101,9 +101,20 @@ test('一四升1级，无拖无剩余', () => {
   assert.equal(res.total, 1);
 });
 
-test('nextLevel: 升级跨越与封顶', () => {
-  assert.equal(nextLevel('2', 3), '5');
-  assert.equal(nextLevel('K', 3), 'A+');  // K→A→过A，封顶 A+
-  assert.equal(nextLevel('A', 1), 'A+');
-  assert.equal(nextLevel('Q', 10), 'A+');
+test('座位重排：队友对角', () => {
+  // 队伍 [0,0,1,1]（0队相邻坐0/1）→ 重排后对角；旧0不动，旧1移到对面
+  const perm = seatPermutation([0, 0, 1, 1]);
+  assert.deepEqual(perm, [0, 3, 1, 2]);
+  // 队伍 [1,0,1,0] 本就是对角 → 全员不动
+  const perm2 = seatPermutation([1, 0, 1, 0]);
+  assert.deepEqual(perm2, [0, 1, 2, 3]);
+  // 队伍 [1,1,0,0]：0队相邻坐2/3 → 旧2不动，旧3移到对面
+  const perm3 = seatPermutation([1, 1, 0, 0]);
+  assert.deepEqual(perm3, [2, 1, 3, 0]);
+  // 所有排列结果都满足对角不变量
+  for (const teamOf of [[0,0,1,1],[0,1,0,1],[0,1,1,0],[1,0,0,1],[1,0,1,0],[1,1,0,0]]) {
+    const p = seatPermutation(teamOf);
+    assert.equal(teamOf[p[0]], teamOf[p[2]], '新座位0/2同队: ' + JSON.stringify(teamOf));
+    assert.equal(teamOf[p[1]], teamOf[p[3]], '新座位1/3同队: ' + JSON.stringify(teamOf));
+  }
 });

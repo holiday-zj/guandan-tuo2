@@ -176,8 +176,8 @@ async function main() {
     for (let i = 0; i < 4; i++) {
       const snapMsg = [...clients[i].inbox].reverse().find(m => m.type === 'snapshot' || m.type === 'game_start');
       const snap = snapMsg && snapMsg.snapshot;
-      if (!snap || snap.turn !== seatOf[i]) continue;
-      const act = chooseAction(snap, seatOf[i]);
+      if (!snap || snap.turn !== snap.mySeat) continue; // 每副牌重排后座位动态变化，用快照里的 mySeat
+      const act = chooseAction(snap, snap.mySeat);
       if (!act) continue;
       const before = clients[i].inbox.length;
       clients[i].send(act);

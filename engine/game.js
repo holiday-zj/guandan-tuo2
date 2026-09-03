@@ -32,7 +32,8 @@ export class Round {
     return this;
   }
 
-  // 亮牌：随机翻出一张，级别=亮牌+1；两张相同亮牌所在玩家结队对坐
+  // 亮牌：随机翻出一张，级别=亮牌+1；两张相同亮牌所在玩家结队
+  // 纯函数：不修改 Round 状态（座位重排由上层在定队后统一处理）
   flip() {
     if (!this.hands[0]) this.deal();
     const deck = makeDeck().filter(c => c.suit !== 'X'); // 亮牌只从普通牌中翻
@@ -46,19 +47,23 @@ export class Round {
     let teams;
     const newLevel = levelFromFlip(pick.rank);
     if (holders.length === 2) {
-      const t = 0, u = 1;
       teams = [0, 0, 0, 0];
-      teams[holders[0]] = t; teams[holders[1]] = t;
-      for (let s = 0; s < 4; s++) if (teams[s] === 0 && s !== holders[0] && s !== holders[1]) teams[s] = u;
+      teams[holders[0]] = 0; teams[holders[1]] = 0;
+      for (let s = 0; s < 4; s++) if (s !== holders[0] && s !== holders[1]) teams[s] = 1;
     } else {
       teams = this.teamOf.slice(); // 两张在同一人 → 队伍不变
     }
-    this.flipCard = pick;
-    this.level = newLevel;
-    this.tug = tugRank(newLevel);
-    this.teamOf = teams;
+    return { flip: pick, level: newLevel, tug: tugRank(newLevel), teamOf: teams, holders };
+  }
+
+  // 应用亮牌结果（座位重排后调用）
+  applyFlip(info) {
+    this.flipCard = info.flip;
+    this.level = info.level;
+    this.tug = info.tug;
+    this.teamOf = info.teamOf;
     this.state = 'flipped';
-    return { flip: pick, level: newLevel, tug: this.tug, teamOf: teams, holders };
+    return info;
   }
 
   // 上局结束后由 Game 调用：进贡与还贡（双贡/单贡/抗贡）

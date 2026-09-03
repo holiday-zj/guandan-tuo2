@@ -12,6 +12,7 @@ export class Room {
     this.id = id;
     this.isPrivate = !!opts.private;
     this.stake = opts.stake || 1;          // 每级游戏币
+    this.rounds = opts.rounds || 8;        // 一场打几副牌（每副独立亮牌定级，不升级）
     this.botFill = !!opts.botFill;
     this.seats = [null, null, null, null]; // memberId or 'bot:N'
     this.state = 'waiting';                // waiting → playing → finished
@@ -100,7 +101,7 @@ export class GameSession {
   }
 
   seatNames() {
-    return this.room.seats.map((id, i) => {
+    return this.match.occupants.map((id, i) => {
       if (!id) return '空位';
       if (String(id).startsWith('bot:')) return '机器人' + String(id).slice(4);
       const m = this.membersById(id);
@@ -108,8 +109,13 @@ export class GameSession {
     });
   }
 
+  // 玩家（房间座位身份）→ 当前副牌的引擎座位（每副牌可能因亮牌重排）
+  engineSeat(occupantId) {
+    return this.match ? this.match.occupants.indexOf(occupantId) : -1;
+  }
+
   start(matchOpts = {}) {
-    this.match = new Match(this.seatNames(), matchOpts);
+    this.match = new Match(this.room.seats, { totalRounds: this.room.rounds, ...matchOpts });
     this.started = true;
     this.room.state = 'playing';
     this.nextRound();
@@ -223,16 +229,16 @@ export class GameSession {
     if (!r.finishedByPlay) r.finishedByPlay = {};
     const result = r.settle(r.finishedByPlay);
     const applied = this.match.applyResult(result);
-    const events = [{ type: 'round_result', result: { ...result, levels: this.match.levels.slice() } }];
+    const events = [{ type: 'round_result', result: { ...result, roundWins: this.match.roundWins.slice() } }];
     if (this.match.matchOver) {
       this.over = true;
       this.winnerTeam = this.match.winnerTeam;
       this.room.state = 'finished';
-      events.push({ type: 'match_over', winnerTeam: this.match.winnerTeam });
+      events.push({ type: 'match_over', winnerTeam: this.match.winnerTeam, roundWins: this.match.roundWins.slice() });
     } else {
-      // 下一副
+      // 下一副（会重新发牌、亮牌、重排座位）
       this.nextRound();
-      events.push({ type: 'next_round', roundNum: this.roundNum, level: this.match.round.level });
+      events.push({ type: 'next_round', roundNum: this.roundNum, level: this.match.round.level, perm: this.match.occupants.slice() });
     }
     return events;
   }
@@ -247,7 +253,7 @@ export class GameSession {
       const r = this.match.round;
       if (r.state !== 'playing') break;
       const seat = this.driver.turn;
-      const occupant = this.room.seats[seat];
+      const occupant = this.match.occupants[seat];
       if (!occupant || !String(occupant).startsWith('bot:')) break; // 轮到真人或空位
       if (!this.active(seat)) break;
       const action = botDecide(this, seat);
@@ -264,16 +270,20 @@ export class GameSession {
     return events;
   }
 
-  // 面向某座位的状态快照（隐藏他人手牌）
-  snapshotFor(seat) {
+  // 面向某玩家的快照（按玩家身份定位，隐藏他人手牌）
+  snapshotFor(occupantId) {
     const r = this.match.round;
+    const seat = this.engineSeat(occupantId);
+    if (seat < 0) return null;
     return {
       roundNum: this.roundNum,
+      totalRounds: this.match.totalRounds,
       level: r.level,
       tug: r.tug,
       flip: r.flipCard ? cardLabel(r.flipCard) : null,
       teamOf: r.teamOf,
       names: this.seatNames(),
+      mySeat: seat,
       hand: r.hands[seat] ? r.hands[seat].map(c => ({ id: c.id, suit: c.suit, rank: c.rank })) : [],
       handCounts: r.hands.map(h => (h ? h.length : 0)),
       turn: this.driver ? this.driver.turn : null,
@@ -285,7 +295,7 @@ export class GameSession {
           }
         : null,
       finishOrder: r.finishOrder,
-      levels: this.match.levels,
+      roundWins: this.match.roundWins,
       tribute: r.tributeInfo || null,
     };
   }
