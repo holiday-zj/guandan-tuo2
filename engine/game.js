@@ -19,7 +19,8 @@ export class Round {
     this.tribute = { required: false, pending: [], done: {} }; // pending: [{from,to,card}]
     this.finishOrder = []; // 出完牌的座位顺序（头游..末游）
     this.lead = null;       // 当前出牌权
-    this.trick = null;      // {cards, interpretation, by}
+    this.led = false;       // 本副首攻是否已出
+    this.trick = null;      // {cards, interpretation, by, locked}
     this.lastTrickWinner = null;
     this.passes = 0;
     this.result = null;
@@ -117,21 +118,35 @@ export class Round {
     if (ids.size !== cards.length) return { ok: false, error: 'duplicate card id' };
     for (const c of cards) if (!hand.some(h => h.id === c.id)) return { ok: false, error: 'card not in hand' };
 
+    // 限制：开局首攻不允许直接出纯拖牌
+    if (!this.led && cards.every(c => c.rank === this.tug))
+      return { ok: false, error: '首攻不能直接出拖牌' };
+
     const it = bestInterpretation(cards, this.level);
     if (!it) return { ok: false, error: 'invalid combination' };
-    if (this.trick && !canBeat(it, this.trick.interpretation))
-      return { ok: false, error: 'cannot beat' };
+    if (this.trick) {
+      // 头游末手纯拖牌：不可被压制
+      if (this.trick.locked) return { ok: false, error: '头游纯拖牌不可压制，请过牌' };
+      if (!canBeat(it, this.trick.interpretation))
+        return { ok: false, error: 'cannot beat' };
+    }
 
     // 出牌成立：从手牌移除
     this.hands[seat] = hand.filter(h => !ids.has(h.id));
-    this.trick = { cards, interpretation: it, by: seat };
+    this.trick = { cards, interpretation: it, by: seat, locked: false };
     this.lastTrickWinner = seat;
+    this.led = true;
     this.passes = 0;
     const event = { ok: true, play: it, remaining: this.hands[seat].length };
 
     if (this.hands[seat].length === 0) {
       this.finishOrder.push(seat);
       event.finished = true;
+      // 拖牌特权：头游（第一个出完者）最后一手为纯拖牌 → 该手不可被压（强制接风给队友）
+      if (this.finishOrder.length === 1 && cards.every(c => c.rank === this.tug)) {
+        this.trick.locked = true;
+        event.tugLocked = true;
+      }
       if (this.finishOrder.length === 3) {
         // 剩最后一人自动末游
         const last = [0, 1, 2, 3].find(s => !this.finishOrder.includes(s));
@@ -170,39 +185,47 @@ export class Round {
     return next;
   }
 
-  // —— 结算（安徽拖2算法）——
-  // 返回 {ranking, base, tugBonus, leftover, total, payPerLoser}
+  // —— 结算（掼蛋·拖2 定制完整版规则）——
+  // 基础分：双上3 / 一三2 / 一四1
+  // 拖牌奖励：双上时头游+二游末手纯拖均计分，否则仅头游；普通拖+1/张，红桃拖+2/张
+  // 末游惩罚：仅末游剩余拖牌每张+1级；双下（对方包揽三游+末游）时两人全算
+  // 总分封顶 13 级
   settle(finishedByPlay = {}) {
     if (this.state !== 'finished') throw new Error('round not finished');
     const [first, second, third, fourth] = this.finishOrder;
     const winTeam = this.teamOf[first];
-    // 基础级
-    let base;
-    if (this.teamOf[second] === winTeam) base = 3;      // 双下
-    else if (this.teamOf[third] === winTeam) base = 2;   // 一三
-    else base = 1;                                        // 一四
+    const doubleWin = this.teamOf[second] === winTeam;  // 双上（对方即双下）
 
-    // 头游/二游脱手的最后一手若是纯拖牌 → 拖级（红拖×2）
+    let base;
+    if (doubleWin) base = 3;                            // 双上
+    else if (this.teamOf[third] === winTeam) base = 2;  // 一三
+    else base = 1;                                      // 一四
+
+    // 拖牌奖励（末手纯拖：单拖/对拖/三张拖/拖炸均可；逢人配模拟的不算）
     let tugBonus = 0;
-    for (const s of [first, second]) {
+    const tugScorers = doubleWin ? [first, second] : [first];
+    for (const s of tugScorers) {
       const lastPlay = finishedByPlay[s];
-      if (lastPlay && lastPlay.every(c => c.rank === this.tug)) {
+      if (lastPlay && lastPlay.length && lastPlay.every(c => c.rank === this.tug)) {
         tugBonus += lastPlay.reduce((sum, c) => sum + tugValueOf(c, this.level), 0);
       }
     }
 
-    // 三游/末游手中剩余拖牌 → 加级（红拖×2）
+    // 末游惩罚：平时只算末游；双下时三游+末游剩余拖牌全算（每张+1级，红拖不翻倍）
     let leftover = 0;
-    for (const s of [third, fourth]) {
-      for (const c of this.hands[s]) leftover += tugValueOf(c, this.level);
+    const penalized = doubleWin ? [third, fourth] : [fourth];
+    for (const s of penalized) {
+      for (const c of this.hands[s]) if (c.rank === this.tug) leftover += 1;
     }
 
-    const total = base + tugBonus + leftover;
+    const total = Math.min(13, base + tugBonus + leftover);
     const losers = [0, 1, 2, 3].filter(s => this.teamOf[s] !== winTeam);
     const winners = [0, 1, 2, 3].filter(s => this.teamOf[s] === winTeam);
     this.result = {
       ranking: { first, second, third, fourth },
-      winTeam, base, tugBonus, leftover, total, losers, winners,
+      winTeam, base, tugBonus, leftover, total,
+      capped: base + tugBonus + leftover > 13,
+      losers, winners,
     };
     return this.result;
   }

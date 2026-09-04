@@ -185,7 +185,10 @@ export class GameSession {
       remaining: r.hands[seat].length,
     });
     if (ev.finished) {
+      if (!r.finishedByPlay) r.finishedByPlay = {};
+      r.finishedByPlay[seat] = cards.slice(); // 记录脱手牌（拖牌计分依据）
       events.push({ type: 'finish', seat, rank: r.finishOrder.indexOf(seat) + 1 });
+      if (ev.tugLocked) events.push({ type: 'tug_locked', seat, tip: '头游纯拖牌，不可压制，强制接风队友' });
     }
     if (r.state === 'finished') {
       events.push(...this.finishRound());

@@ -71,9 +71,15 @@ export function makeSimpleBot(seed = 1) {
   return {
     lead(r, seat) {
       const hand = r.hands[seat].slice().sort(byValue(r, r.level));
+      // 首攻禁拖：跳过拖牌
+      if (!r.led) {
+        for (const c of hand) if (c.rank !== r.tug) return [c];
+      }
       return [hand[0]]; // 出最小单张
     },
     respond(r, seat, best) {
+      // 锁定牌圈（头游纯拖）：只能过
+      if (r.trick && r.trick.locked) return null;
       const hand = r.hands[seat].slice().sort(byValue(r, r.level));
       // 只对单张响应：找最小的可压制单张（用引擎验证合法性）
       if (best.cards.length === 1) {

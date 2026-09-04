@@ -5,7 +5,8 @@ import { classifyNatural, canBeat, beatScore } from './classify.js';
 
 const SUITS = ['♠', '♥', '♣', '♦'];
 const RANKS = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A'];
-const NEXT = { '2': '3', '3': '4', '4': '5', '5': '6', '6': '7', '7': '8', '8': '9', '9': 'T', 'T': 'J', 'J': 'Q', 'Q': 'K', 'K': 'A', 'A': '2' };
+// 注意：A 不连回 2（掼蛋顺子只允许 A2345 特例与 10JQKA，其余牌型不允许绕 A）
+const NEXT = { '2': '3', '3': '4', '4': '5', '5': '6', '6': '7', '7': '8', '8': '9', '9': 'T', 'T': 'J', 'J': 'Q', 'Q': 'K', 'K': 'A' };
 
 function byValueDesc(level) {
   return (a, b) => orderValue(b.rank, level) - orderValue(a.rank, level);

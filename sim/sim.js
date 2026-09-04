@@ -29,7 +29,7 @@ for (let i = 0; i < N; i++) {
       const result = round.settle(round.finishedByPlay || {});
       m.applyResult(result);
       // 基本不变量检查
-      if (result.total < 1 || result.total > 40) throw new Error(`total out of range: ${result.total}`);
+      if (result.total < 1 || result.total > 13) throw new Error(`total out of range: ${result.total}`);
       if (result.losers.length !== 2) throw new Error('losers != 2');
     }
     ok++;
