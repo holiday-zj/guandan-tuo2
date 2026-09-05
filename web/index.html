@@ -65,7 +65,7 @@ const api = {
 // —— 状态 ——
 const ui = { scene:'login', mySeat:null, myId:null, snap:null, roomId:null, roomState:null,
   selected:new Set(), buttons:[], cardRects:[], toast:null, deadline:null,
-  hintOpts:[], hintIdx:0, sfIdx:0, lastHandKey:null, sortMode:'suit',
+  hintOpts:[], hintIdx:0, sfIdx:0, lastHandKey:null, sortMode:'grid',
   teamIdx:0, hoverCard:null, banner:null, finalRanking:null, terminatedReason:null,
   endDialog:null, voteDialog:null };
 const TURN_MS = 30000;
@@ -149,10 +149,11 @@ function drawCard(c,x,y,w,h,o={}){
   // 中央花色
   ctx.globalAlpha=.16; ctx.font=Math.floor(h*.52)+'px serif'; ctx.textAlign='center';
   ctx.fillText(c.suit, x+w*.62, y+oy+h*.82); ctx.globalAlpha=1;
-  if(o.wild){
-    ctx.fillStyle='#ff8f00'; rr(x+w-26,y+oy+4,22,22,5); ctx.fill();
-    ctx.fillStyle='#fff'; ctx.font='bold 15px sans-serif'; ctx.textAlign='center';
-    ctx.fillText('配', x+w-15, y+oy+21);
+  // 角标（级牌/拖牌）
+  if(o.badge){
+    ctx.fillStyle=o.badgeColor||'#f9a825'; rr(x+w-25,y+oy+3,22,22,6); ctx.fill();
+    ctx.fillStyle='#fff'; ctx.font='bold 14px sans-serif'; ctx.textAlign='center';
+    ctx.fillText(o.badge, x+w-14, y+oy+20);
   }
   ctx.textAlign='left';
 }
@@ -415,14 +416,14 @@ function renderGame(){
   if(s.turn===ui.mySeat) drawCountdown(W/2, 210);
 
   // —— 手牌区 ——
-  if(ui.sortMode==='suit') renderHandBySuit(s);   // 花色分行（默认，好看同花顺）
-  else renderHandSingle(s);                        // 点数单行
+  if(ui.sortMode==='grid') renderHandGrid(s);     // 矩阵摆牌（默认：点数横排、同点数竖叠、同花色尽量同行）
+  else renderHandSingle(s);                       // 点数单行
 
   // —— 右侧工具栏 ——
   const tx = W-190, ty0 = 380;
   const myTurn = s.turn===ui.mySeat && !s.finishOrder.includes(ui.mySeat);
   let ty = ty0;
-  btn(ui.sortMode==='suit'?'🀄 按点数':'🀄 按花色', tx, ty, 170, 50, ()=>{ ui.sortMode = ui.sortMode==='value'?'suit':'value'; }, {color:'#37474f',color2:'#263238',size:18,radius:25}); ty += 60;
+  btn(ui.sortMode==='grid'?'🀄 单行排列':'🀄 矩阵摆牌', tx, ty, 170, 50, ()=>{ ui.sortMode = ui.sortMode==='grid'?'value':'grid'; }, {color:'#37474f',color2:'#263238',size:18,radius:25}); ty += 60;
   btn('🌈 同花顺', tx, ty, 170, 50, showStraightFlush, {color:'#7b1fa2',color2:'#6a1b9a',size:18,radius:25}); ty += 60;
   if(myTurn){
     btn('💡 提示', tx, ty, 170, 50, doHint, {color:'#546e7a',color2:'#37474f',size:18,radius:25}); ty += 60;
@@ -430,6 +431,92 @@ function renderGame(){
     if(s.best){ btn('过', tx, ty, 170, 50, ()=>{ api.send({type:'pass'}); ui.selected.clear(); ui.hintOpts=[]; }, {color:'#78909c',color2:'#546e7a',size:18,radius:25}); ty += 60; }
   }
   btn('🏳 结束', tx, ty, 170, 50, requestEndMatch, {color:'#c62828',color2:'#b71c1c',size:18,radius:25});
+}
+
+// 手牌矩阵摆牌（参考成熟掼蛋游戏）：
+// 点数从小到大横向排成列；同点数的牌竖着叠放；同花色尽量对齐同一行
+// —— 这样同花顺就是横向一条直线，一眼可见 ——
+function renderHandGrid(s){
+  const level = s.level;
+  // 1) 按点数分列
+  const colsMap = new Map(); // value -> cards[]
+  for(const c of s.hand){
+    const v = val(c, level);
+    if(!colsMap.has(v)) colsMap.set(v, []);
+    colsMap.get(v).push(c);
+  }
+  let cols = [...colsMap.entries()].sort((a,b)=>a[0]-b[0]);
+  // 超过4张的列拆成相邻两列（保持同点数相邻）
+  const expanded = [];
+  for(const [v, cards] of cols){
+    if(cards.length<=4){ expanded.push([v,cards]); }
+    else {
+      const half = Math.ceil(cards.length/2);
+      expanded.push([v, cards.slice(0,half)], [v, cards.slice(half)]);
+    }
+  }
+  // 2) 贪心行分配：花色尽量固定行（同花色横向对齐）
+  const suitPref = {'♠':0,'♥':1,'♣':2,'♦':3,'X':4};
+  const occupied = new Map(); // "col,row" -> true
+  let maxRow = 0;
+  const placed = []; // {card, col, row}
+  // 先放占位多的列提高对齐质量
+  const order = expanded.map((c,i)=>i).sort((a,b)=>expanded[b][1].length-expanded[a][1].length);
+  const colRows = new Array(expanded.length).fill(null);
+  for(const ci of order){
+    const cards = expanded[ci][1];
+    const rows = new Set();
+    for(const c of cards){
+      let r = suitPref[c.suit] ?? 4;
+      while(occupied.has(ci+','+r)) r++;
+      occupied.set(ci+','+r, true);
+      rows.add(r);
+      maxRow = Math.max(maxRow, r);
+      colRows[ci] = rows;
+      placed.push({card:c, col:ci, row:r});
+    }
+  }
+  // 3) 渲染
+  const nCols = expanded.length, nRows = maxRow+1;
+  const availW = W-190-150-20;
+  const gx = Math.min(64, availW/Math.max(1,nCols));          // 列多时压缩列距
+  const gy = Math.min(86, Math.floor((H-336-16)/Math.max(1,nRows))); // 行多时压缩行距
+  const cw = Math.min(58, Math.floor(gx)-3);                  // 牌宽随列距缩
+  const ch = Math.min(80, Math.floor(gy)-4);                  // 牌高随行距缩
+  const gridW = nCols*gx;
+  const startX = 150 + Math.max(0,(availW-gridW)/2);
+  const startY = Math.max(336, H - nRows*gy - 16);
+  ui.cardRects=[];
+  ui.hoverCard=null;
+  // 行首花色参考标记（取该行的主导花色）
+  for(let r=0;r<nRows;r++){
+    const cnt = {};
+    for(const p of placed) if(p.row===r){ const su=p.card.suit; cnt[su]=(cnt[su]||0)+1; }
+    const dom = Object.entries(cnt).sort((a,b)=>b[1]-a[1])[0];
+    if(dom && dom[0]!=='X'){
+      ctx.globalAlpha=.5; ctx.fillStyle=SUIT_COLOR[dom[0]];
+      ctx.font='bold 22px sans-serif'; ctx.textAlign='center';
+      ctx.fillText(dom[0], startX-42, startY+r*gy+ch/2+8);
+      ctx.globalAlpha=1;
+    }
+  }
+  for(const p of placed){
+    const c = p.card;
+    const x = startX + p.col*gx;
+    const y = startY + p.row*gy;
+    const sel = ui.selected.has(c.id);
+    const isLevel = c.rank===level && c.suit!=='X';
+    const isWild = c.suit==='♥'&&c.rank===level;
+    const isTug = c.rank===s.tug;
+    const hl = ui.hintOpts[ui.hintIdx] && ui.hintOpts[ui.hintIdx].some(h=>h.id===c.id);
+    const hover = mouse.x>=x&&mouse.x<=x+cw&&mouse.y>=y-12&&mouse.y<=y+ch;
+    if(hover && !sel) ui.hoverCard = c.id;
+    drawCard(c,x,y,cw,ch,{sel,hl,
+      badge: isWild?'配':(isLevel?'级':(isTug?'拖':null)),
+      badgeColor: isWild?'#ff8f00':(isLevel?'#f9a825':'#4fc3f7')});
+    if(hover && !sel){ ctx.save(); ctx.globalAlpha=.35; ctx.strokeStyle='#fff'; ctx.lineWidth=2; rr(x,y,cw,ch,7); ctx.stroke(); ctx.restore(); }
+    ui.cardRects.push({x,y:y-(sel?14:0),w:cw,h:ch,id:c.id});
+  }
 }
 
 // 手牌单行渲染（按点数排序）
@@ -450,55 +537,6 @@ function renderHandSingle(s){
     drawCard(c,x,baseY,cw,ch,{sel,wild,hl});
     if(hover && !sel){ ctx.save(); ctx.globalAlpha=.35; ctx.strokeStyle='#fff'; ctx.lineWidth=2; rr(x,baseY,cw,ch,8); ctx.stroke(); ctx.restore(); }
     ui.cardRects.push({x,y:baseY-(sel?18:0),w:cw,h:ch,id:c.id});
-  });
-}
-
-// 手牌按花色分行渲染：每花色一行，行内按点数升序，方便目视同花顺
-function renderHandBySuit(s){
-  const level = s.level;
-  const groups = new Map(); // suit -> cards[]
-  for(const c of s.hand){
-    if(!groups.has(c.suit)) groups.set(c.suit, []);
-    groups.get(c.suit).push(c);
-  }
-  const suitOrder = ['♠','♥','♣','♦','X'];
-  const rows = suitOrder.filter(su=>groups.has(su)).map(su=>{
-    const cards = groups.get(su).slice().sort((a,b)=>val(a,level)-val(b,level));
-    return { suit: su, cards };
-  });
-
-  const handX = 150, handW = W-190-150-30;
-  const rowH = 74, cardW = 56, cardH = 74;
-  const totalH = rows.length*rowH;
-  const startY = Math.max(368, H - totalH - 18);
-
-  ui.cardRects = [];
-  ui.hoverCard = null;
-  rows.forEach((row, ri)=>{
-    const y = startY + ri*rowH;
-    // 行首花色标记
-    if(row.suit!=='X'){
-      ctx.fillStyle = SUIT_COLOR[row.suit];
-      ctx.font='bold 26px sans-serif'; ctx.textAlign='center';
-      ctx.fillText(row.suit, handX-56, y+cardH/2+9);
-    } else {
-      ctx.fillStyle='#c62828'; ctx.font='bold 18px sans-serif'; ctx.textAlign='center';
-      ctx.fillText('王', handX-56, y+cardH/2+6);
-    }
-    // 行内卡牌
-    const n = row.cards.length;
-    const gap = n>1 ? Math.min(30,(handW-cardW)/(n-1)) : 0;
-    row.cards.forEach((c,i)=>{
-      const x = handX + i*gap;
-      const sel = ui.selected.has(c.id);
-      const wild = c.suit==='♥'&&c.rank===level;
-      const hl = ui.hintOpts[ui.hintIdx] && ui.hintOpts[ui.hintIdx].some(h=>h.id===c.id);
-      const hover = mouse.x>=x&&mouse.x<=x+cardW&&mouse.y>=y-14&&mouse.y<=y+cardH;
-      if(hover && !sel) ui.hoverCard = c.id;
-      drawCard(c,x,y,cardW,cardH,{sel,wild,hl});
-      if(hover && !sel){ ctx.save(); ctx.globalAlpha=.35; ctx.strokeStyle='#fff'; ctx.lineWidth=2; rr(x,y,cardW,cardH,7); ctx.stroke(); ctx.restore(); }
-      ui.cardRects.push({x,y:y-(sel?14:0),w:cardW,h:cardH,id:c.id});
-    });
   });
 }
 
