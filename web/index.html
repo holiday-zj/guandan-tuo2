@@ -457,23 +457,22 @@ function renderHandGrid(s){
       expanded.push([v, cards.slice(0,half)], [v, cards.slice(half)]);
     }
   }
-  // 2) 布局：同点数一列竖向向下叠压（每张露出左上角数字花色）；
-  //    列内顺序固定：从下往上 红桃→方片→黑桃→梅花（王在最上）
+  // 2) 布局：同点数一列，底部对齐；列内从下往上 红桃→方片→黑桃→梅花（王最上）；
+  //    叠压方向：下面的牌压住上面牌的下半截，每张露出左上角数字花色
   const suitOrder = {'♥':0,'♦':1,'♠':2,'♣':3,'X':4}; // 值小 = 摆得靠下
+  const maxN = Math.max(...expanded.map(e=>e[1].length)); // 最高列的张数（≤4）
   const placed = []; // {card, col, row}
-  let maxRow = 0;
   for(let ci=0; ci<expanded.length; ci++){
     const cards = expanded[ci][1].slice().sort((a,b)=> (suitOrder[a.suit]??4) - (suitOrder[b.suit]??4));
     const n = cards.length;
     cards.forEach((c,j)=>{
-      const row = (n-1) - j; // j=0（红桃）在最底行，最后一张（梅花/王）在最顶行
+      const row = maxN - 1 - j; // 红桃(j=0)在最底行，往上依次方片/黑桃/梅花；所有列底行对齐
       placed.push({card:c, col:ci, row});
-      if(row>maxRow) maxRow=row;
     });
   }
-  const nRows = maxRow+1;
+  const nRows = maxN;
   const nCols = expanded.length;
-  // 3) 渲染（向下叠压：每张露出左上角数字花色）
+  // 3) 渲染（底部对齐；绘制顺序：最上边的牌先画在底层，下面的牌依次叠上来压住上面牌的下半截）
   const availW = W-190-150-20;
   const gx = Math.min(64, availW/Math.max(1,nCols));          // 列多时压缩列距
   const cw = Math.min(58, Math.floor(gx)-3);                  // 牌宽随列距缩
@@ -485,8 +484,10 @@ function renderHandGrid(s){
   ui.cardRects=[];
   ui.hoverCard=null;
   // 点击判定：被下面的牌压住的牌，只露出顶部一条（含数字花色），点那里即选中该牌
+  // 绘制顺序：按行从上到下画 —— 最上面的牌在底层，下面的牌压住上面牌的下半截，每张左上角都露出
   const cellSet = new Set(placed.map(p=>p.col+','+p.row));
-  for(const p of placed){
+  const drawOrder = placed.slice().sort((a,b)=> a.row - b.row || a.col - b.col);
+  for(const p of drawOrder){
     const c = p.card;
     const x = startX + p.col*gx;
     const y = startY + p.row*gy;
