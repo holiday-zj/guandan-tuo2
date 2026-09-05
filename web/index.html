@@ -391,7 +391,7 @@ function renderGame(){
   ctx.textAlign='right'; ctx.font='bold 22px sans-serif';
   const myScore = s.scores ? s.scores[ui.mySeat] : 0;
   ctx.fillStyle = myScore>=0 ? '#a5d6a7' : '#ef9a9a';
-  ctx.fillText(`积分 ${myScore>=0?'+':''}${myScore}`, W-24, 23);
+  ctx.fillText(`积分 ${myScore>=0?'+':''}${myScore}`, W-150, 23); // 给右上角结束按钮留位
   ctx.textBaseline='alphabetic';
 
   // —— 四家面板 + 各自出牌区（参考截图布局）——
@@ -430,9 +430,13 @@ function renderGame(){
   if(myTurn){
     btn('💡 提示', tx, ty, 170, 50, doHint, {color:'#546e7a',color2:'#37474f',size:18,radius:25}); ty += 60;
     btn('出 牌', tx, ty, 170, 56, doPlay, {color:'#f9a825',color2:'#f57f17',size:22,radius:28}); ty += 66;
-    if(s.best){ btn('过', tx, ty, 170, 50, ()=>{ api.send({type:'pass'}); ui.selected.clear(); ui.hintOpts=[]; }, {color:'#78909c',color2:'#546e7a',size:18,radius:25}); ty += 60; }
   }
-  btn('🏳 结束', tx, ty, 170, 50, requestEndMatch, {color:'#c62828',color2:'#b71c1c',size:18,radius:25});
+  // 过：左侧（轮到自己且桌面上有牌可跟时）
+  if(myTurn && s.best){
+    btn('过', 24, 400, 110, 60, ()=>{ api.send({type:'pass'}); ui.selected.clear(); ui.hintOpts=[]; }, {color:'#78909c',color2:'#546e7a',size:22,radius:30});
+  }
+  // 结束：最右上角
+  btn('结束', W-130, 5, 120, 34, requestEndMatch, {color:'#c62828',color2:'#b71c1c',size:16,radius:17});
 }
 
 // 手牌矩阵摆牌（参考成熟掼蛋游戏）：
