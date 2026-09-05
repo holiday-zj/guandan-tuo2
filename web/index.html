@@ -455,26 +455,32 @@ function renderHandGrid(s){
       expanded.push([v, cards.slice(0,half)], [v, cards.slice(half)]);
     }
   }
-  // 2) 布局：同点数从下往上叠放；同花色尽量对齐同一行（尽力而为，不强制）
-  const suitLane = {};       // 花色 -> 该花色最近一列所在行（用于对齐参考）
+  // 2) 布局：同点数从上往下叠压（后面的牌压住前一张的底部，每张露出左上角数字花色）；
+  //    同花色尽量对齐同一行（尽力而为，不强制）
+  const suitLane = {};       // 花色 -> 该花色最近一张所在行（对齐参考）
   const placed = [];         // {card, col, row}
   let minRow = Infinity, maxRow = -Infinity;
   for(let ci=0; ci<expanded.length; ci++){
     const cards = expanded[ci][1].slice();
-    // 有对齐参考的牌按行号降序排（大行号的放下面），其余按花色聚拢
-    cards.sort((a,b)=> (suitLane[b.suit] ?? -1) - (suitLane[a.suit] ?? -1) || a.suit.localeCompare(b.suit));
-    // 选底行 R：对有参考的牌，理想 R = 参考行 + j（j=自底向上位置），取中位数
+    // 有对齐参考的牌按参考行升序排（行号小的放上面），其余按花色聚拢
+    cards.sort((a,b)=>{
+      const ra = suitLane[a.suit], rb = suitLane[b.suit];
+      if(ra!==undefined && rb!==undefined) return ra-rb;
+      if(ra!==undefined) return -1;
+      if(rb!==undefined) return 1;
+      return a.suit.localeCompare(b.suit);
+    });
+    // 选顶行 R：第 j 张牌（行 R+j）若有花色参考，理想 R = 参考行 - j，取中位数
     const cand = [];
-    cards.forEach((c,j)=>{ if(suitLane[c.suit]!==undefined) cand.push(suitLane[c.suit]+j); });
+    cards.forEach((c,j)=>{ if(suitLane[c.suit]!==undefined) cand.push(suitLane[c.suit]-j); });
     let R;
     if(cand.length){ cand.sort((a,b)=>a-b); R = cand[Math.floor(cand.length/2)]; }
-    else R = 2;                        // 无对齐信息：默认基线行
-    R = Math.max(R, cards.length-1);   // 保证整叠不超出顶行
-    // 从下往上叠：j=0 在最底
+    else R = 0;
+    // 从上往下叠：j=0 在最上面，后面依次压下来
     cards.forEach((c,j)=>{
-      const row = R - j;
+      const row = R + j;
       placed.push({card:c, col:ci, row});
-      suitLane[c.suit] = row;          // 更新该花色的对齐参考
+      suitLane[c.suit] = row;
       if(row<minRow) minRow=row;
       if(row>maxRow) maxRow=row;
     });
@@ -482,16 +488,16 @@ function renderHandGrid(s){
   // 行号归一化（平移到从0开始）
   for(const p of placed) p.row -= minRow;
   maxRow -= minRow;
-  // 3) 渲染
+  // 3) 渲染（上下紧凑叠放：行距≈牌高的40%，露出左上角数字花色即可）
   const nCols = expanded.length, nRows = maxRow+1;
   const availW = W-190-150-20;
   const gx = Math.min(64, availW/Math.max(1,nCols));          // 列多时压缩列距
-  const gy = Math.min(86, Math.floor((H-336-16)/Math.max(1,nRows))); // 行多时压缩行距
   const cw = Math.min(58, Math.floor(gx)-3);                  // 牌宽随列距缩
-  const ch = Math.min(80, Math.floor(gy)-4);                  // 牌高随行距缩
+  const ch = Math.min(84, cw*1.4);                            // 牌高按宽高比
+  const gy = Math.min(Math.floor(ch*0.55), Math.floor((H-340-16-ch)/Math.max(1,nRows))); // 行距：露出左上角数字+花色
   const gridW = nCols*gx;
   const startX = 150 + Math.max(0,(availW-gridW)/2);
-  const startY = Math.max(336, H - nRows*gy - 16);
+  const startY = Math.max(336, H - ((nRows-1)*gy + ch) - 14);
   ui.cardRects=[];
   ui.hoverCard=null;
   // 行首花色参考标记（取该行的主导花色）
@@ -506,6 +512,8 @@ function renderHandGrid(s){
       ctx.globalAlpha=1;
     }
   }
+  // 点击判定：被下面的牌压住的牌，只露出顶部一条（含数字花色），点那里即选中该牌
+  const cellSet = new Set(placed.map(p=>p.col+','+p.row));
   for(const p of placed){
     const c = p.card;
     const x = startX + p.col*gx;
@@ -515,13 +523,15 @@ function renderHandGrid(s){
     const isWild = c.suit==='♥'&&c.rank===level;
     const isTug = c.rank===s.tug;
     const hl = ui.hintOpts[ui.hintIdx] && ui.hintOpts[ui.hintIdx].some(h=>h.id===c.id);
-    const hover = mouse.x>=x&&mouse.x<=x+cw&&mouse.y>=y-12&&mouse.y<=y+ch;
+    const coveredByBelow = cellSet.has(p.col+','+(p.row+1));
+    const hitH = coveredByBelow ? gy : ch; // 被下面牌压住时，只有露出的顶部可点
+    const hover = mouse.x>=x&&mouse.x<=x+cw&&mouse.y>=y&&mouse.y<=y+hitH;
     if(hover && !sel) ui.hoverCard = c.id;
     drawCard(c,x,y,cw,ch,{sel,hl,
       badge: isWild?'配':(isLevel?'级':(isTug?'拖':null)),
       badgeColor: isWild?'#ff8f00':(isLevel?'#f9a825':'#4fc3f7')});
     if(hover && !sel){ ctx.save(); ctx.globalAlpha=.35; ctx.strokeStyle='#fff'; ctx.lineWidth=2; rr(x,y,cw,ch,7); ctx.stroke(); ctx.restore(); }
-    ui.cardRects.push({x,y:y-(sel?14:0),w:cw,h:ch,id:c.id});
+    ui.cardRects.push({x,y,w:cw,h:hitH,id:c.id});
   }
 }
 
