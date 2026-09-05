@@ -102,21 +102,12 @@ await ws[0].waitFor(m => m.type === 'game_start');
 await ws[1].waitFor(m => m.type === 'game_start');
 console.log('✓ 对局开始（2真人+2机器人，8副制）');
 
-// 玩家1 发起结束申请（带原因）
+// 玩家1 发起结束申请（带原因）—— 含机器人的试玩模式：申请即默认通过
 ws[0].send({ type: 'end_request', reason: '测试提前结束' });
-const prop0 = await ws[0].waitFor(m => m.type === 'end_proposal');
-console.log('✓ 收到申请广播：', prop0.byName, '原因:', prop0.reason, '票数:', prop0.votes + '/' + prop0.need);
-
-// 玩家2 也收到广播
-const prop1 = await ws[1].waitFor(m => m.type === 'end_proposal');
-if (prop1.votes !== 1) throw new Error('玩家2收到的票数应为1');
-
-// 玩家2 同意 → 达到2票，比赛终止
-ws[1].send({ type: 'end_vote', agree: true });
 const over0 = await ws[0].waitFor(m => m.type === 'match_over');
 const over1 = await ws[1].waitFor(m => m.type === 'match_over');
 const ev0 = over0;
-console.log('✓ 比赛已终止：', ev0.terminated ? '是' : '否', '原因:', ev0.reason);
+console.log('✓ 比赛已终止（试玩模式默认通过）：', ev0.terminated ? '是' : '否', '原因:', ev0.reason);
 console.log('✓ 个人积分排名:', ev0.ranking.map(r => `${r.name}(${r.score >= 0 ? '+' : ''}${r.score})`).join(' '));
 if (!ev0.terminated) throw new Error('应标记为提前结束');
 if (ev0.ranking.length !== 4) throw new Error('排名应有4人');

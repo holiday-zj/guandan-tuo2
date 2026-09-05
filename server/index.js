@@ -243,7 +243,14 @@ function handleMsg(member, msg) {
     case 'end_request': {
       const session = sessions.get(c.roomId);
       if (!session || session.over) { ws.send({ type: 'error', error: '对局未开始' }); break; }
-      // 发起提前结束申请（申请人默认同意，需共2人同意）
+      // 试玩/人机房（含机器人）：申请即默认通过，直接结束
+      const room = lobby.rooms.get(c.roomId);
+      const hasBots = room && room.seats.some(id => id && String(id).startsWith('bot:'));
+      if (hasBots) {
+        terminateMatch(c.roomId, '提前结束（' + member.name + ' 申请，试玩模式默认通过）');
+        break;
+      }
+      // 纯真人房：发起提前结束申请（申请人默认同意，需共2人同意）
       session.endVote = {
         by: member.id, byName: member.name,
         reason: String(msg.reason || '').slice(0, 50),
