@@ -101,6 +101,7 @@ export class GameSession {
     this.endVote = null;   // {by, byName, reason, votes:Set, expiresAt}
     this.lastPlays = {};   // seat -> {pass} 或 {cards:[...]} 当前圈内各家最近动作
     this.turnStartedAt = Date.now();
+    this._finishNotified = new Set(); // 已发过 finish 事件的座位（含自动判定的名次）
   }
 
   seatNames() {
@@ -143,11 +144,24 @@ export class GameSession {
     };
     this.lastPlays = {};
     this.turnStartedAt = Date.now();
+    this._finishNotified = new Set();
     return info;
   }
 
   active(s) { return !this.match.round.finishOrder.includes(s); }
   activeCount() { return [0, 1, 2, 3].filter(s => this.active(s)).length; }
+
+  // 给所有新确定名次的玩家发 finish 事件（含自动判定的三游/末游），
+  // 保证每个人的客户端都能看到自己的名次
+  emitFinishes(events) {
+    const r = this.match.round;
+    for (const s of r.finishOrder) {
+      if (!this._finishNotified.has(s)) {
+        this._finishNotified.add(s);
+        events.push({ type: 'finish', seat: s, rank: r.finishOrder.indexOf(s) + 1 });
+      }
+    }
+  }
 
   // 处理玩家动作：{type:'play', cards} 或 {type:'pass'}
   handleAction(seat, action) {
@@ -195,9 +209,17 @@ export class GameSession {
     if (ev.finished) {
       if (!r.finishedByPlay) r.finishedByPlay = {};
       r.finishedByPlay[seat] = cards.slice(); // 记录脱手牌（拖牌计分依据）
-      events.push({ type: 'finish', seat, rank: r.finishOrder.indexOf(seat) + 1 });
       if (ev.tugLocked) events.push({ type: 'tug_locked', seat, tip: '头游纯拖牌，不可压制，强制接风队友' });
+      // 双上（本队包揽头游+二游）：本副立即结束，剩余两人自动三游/末游
+      if (r.state === 'playing' && r.finishOrder.length === 2) {
+        const [a, b] = r.finishOrder;
+        if (r.teamOf[a] === r.teamOf[b]) {
+          for (let s = 0; s < 4; s++) if (!r.finishOrder.includes(s)) r.finishOrder.push(s);
+          r.state = 'finished';
+        }
+      }
     }
+    this.emitFinishes(events); // 出完者 + 自动判定名次者，全部通知
     if (r.state === 'finished') {
       events.push(...this.finishRound());
     } else {
@@ -224,6 +246,7 @@ export class GameSession {
       // 终局
       for (let s = 0; s < 4; s++) if (!r.finishOrder.includes(s)) r.finishOrder.push(s);
       r.state = 'finished';
+      this.emitFinishes(events);
       events.push(...this.finishRound());
       return events;
     }
