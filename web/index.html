@@ -455,27 +455,33 @@ function renderHandGrid(s){
       expanded.push([v, cards.slice(0,half)], [v, cards.slice(half)]);
     }
   }
-  // 2) 贪心行分配：花色尽量固定行（同花色横向对齐）
-  const suitPref = {'♠':0,'♥':1,'♣':2,'♦':3,'X':4};
-  const occupied = new Map(); // "col,row" -> true
-  let maxRow = 0;
-  const placed = []; // {card, col, row}
-  // 先放占位多的列提高对齐质量
-  const order = expanded.map((c,i)=>i).sort((a,b)=>expanded[b][1].length-expanded[a][1].length);
-  const colRows = new Array(expanded.length).fill(null);
-  for(const ci of order){
-    const cards = expanded[ci][1];
-    const rows = new Set();
-    for(const c of cards){
-      let r = suitPref[c.suit] ?? 4;
-      while(occupied.has(ci+','+r)) r++;
-      occupied.set(ci+','+r, true);
-      rows.add(r);
-      maxRow = Math.max(maxRow, r);
-      colRows[ci] = rows;
-      placed.push({card:c, col:ci, row:r});
-    }
+  // 2) 布局：同点数从下往上叠放；同花色尽量对齐同一行（尽力而为，不强制）
+  const suitLane = {};       // 花色 -> 该花色最近一列所在行（用于对齐参考）
+  const placed = [];         // {card, col, row}
+  let minRow = Infinity, maxRow = -Infinity;
+  for(let ci=0; ci<expanded.length; ci++){
+    const cards = expanded[ci][1].slice();
+    // 有对齐参考的牌按行号降序排（大行号的放下面），其余按花色聚拢
+    cards.sort((a,b)=> (suitLane[b.suit] ?? -1) - (suitLane[a.suit] ?? -1) || a.suit.localeCompare(b.suit));
+    // 选底行 R：对有参考的牌，理想 R = 参考行 + j（j=自底向上位置），取中位数
+    const cand = [];
+    cards.forEach((c,j)=>{ if(suitLane[c.suit]!==undefined) cand.push(suitLane[c.suit]+j); });
+    let R;
+    if(cand.length){ cand.sort((a,b)=>a-b); R = cand[Math.floor(cand.length/2)]; }
+    else R = 2;                        // 无对齐信息：默认基线行
+    R = Math.max(R, cards.length-1);   // 保证整叠不超出顶行
+    // 从下往上叠：j=0 在最底
+    cards.forEach((c,j)=>{
+      const row = R - j;
+      placed.push({card:c, col:ci, row});
+      suitLane[c.suit] = row;          // 更新该花色的对齐参考
+      if(row<minRow) minRow=row;
+      if(row>maxRow) maxRow=row;
+    });
   }
+  // 行号归一化（平移到从0开始）
+  for(const p of placed) p.row -= minRow;
+  maxRow -= minRow;
   // 3) 渲染
   const nCols = expanded.length, nRows = maxRow+1;
   const availW = W-190-150-20;
