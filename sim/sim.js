@@ -34,7 +34,8 @@ for (let i = 0; i < N; i++) {
     }
     ok++;
     if (i < 3 || i === N - 1) {
-      console.log(`[match ${i + 1}] rounds=${m.roundNo} roundWins=${JSON.stringify(m.roundWins)} winner=${m.winnerTeam === -1 ? '平局' : '队伍' + m.winnerTeam}`);
+      const rk = m.ranking();
+      console.log(`[match ${i + 1}] rounds=${m.roundNo} top=${rk[0].id}(${rk[0].score}) scores=${JSON.stringify(m.scores())}`);
     }
   } catch (e) {
     fails.push({ i, err: e.message });

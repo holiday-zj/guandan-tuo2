@@ -27,7 +27,8 @@ function fit(){
 window.addEventListener('resize', fit); fit();
 
 const RANK_ORDER = {'2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'T':10,'J':11,'Q':12,'K':13,'A':14};
-const SUIT_COLOR = {'♠':'#263238','♥':'#d32f2f','♣':'#263238','♦':'#d32f2f'};
+// 四花色颜色各自区分：红桃红 / 方片橙 / 黑桃深蓝 / 梅花黑，方便识别同花顺
+const SUIT_COLOR = {'♠':'#1a237e','♥':'#e53935','♣':'#212121','♦':'#fb8c00'};
 const AVATAR_BG = ['#5c6bc0','#26a69a','#ef5350','#ffa726'];
 
 // —— 网络 ——
@@ -62,9 +63,11 @@ const api = {
 };
 
 // —— 状态 ——
-const ui = { scene:'login', mySeat:null, snap:null, roomId:null, roomState:null,
+const ui = { scene:'login', mySeat:null, myId:null, snap:null, roomId:null, roomState:null,
   selected:new Set(), buttons:[], cardRects:[], toast:null, deadline:null,
-  hintOpts:[], hintIdx:0, teamIdx:0, hoverCard:null, banner:null, dealAnim:0 };
+  hintOpts:[], hintIdx:0, sfIdx:0, lastHandKey:null, sortMode:'value',
+  teamIdx:0, hoverCard:null, banner:null, finalRanking:null, terminatedReason:null,
+  endDialog:null, voteDialog:null };
 const TURN_MS = 30000;
 let mouse = {x:-1,y:-1};
 
@@ -195,7 +198,8 @@ function playerPanel(x,y,seat,o={}){
 // —— 场景 ——
 function render(){
   ctx.clearRect(0,0,W,H); ui.buttons=[];
-  ({login:renderLogin, lobby:renderLobby, room:renderRoom, game:renderGame}[ui.scene]||renderLogin)();
+  ({login:renderLogin, lobby:renderLobby, room:renderRoom, game:renderGame, result:renderResult}[ui.scene]||renderLogin)();
+  if(ui.scene==='game'){ renderEndDialog(); renderVoteDialog(); }
   drawBanner(); drawToast();
   requestAnimationFrame(render);
 }
@@ -347,11 +351,11 @@ function renderGame(){
     ctx.fillStyle='#fff'; ctx.textAlign='right'; ctx.fillText(v, cx+106, 28);
     cx += 136;
   }
-  // 比分
-  ctx.textAlign='right'; ctx.font='bold 26px sans-serif';
-  ctx.fillStyle='#a5d6a7'; ctx.fillText(`我方 ${s.roundWins[ui.teamIdx]}`, W-170, 28);
-  ctx.fillStyle='rgba(255,255,255,.5)'; ctx.fillText(':', W-140, 28);
-  ctx.fillStyle='#ef9a9a'; ctx.fillText(`${s.roundWins[1-ui.teamIdx]} 对方`, W-26, 28);
+  // 个人积分（积分绑定到个人，非队伍）
+  ctx.textAlign='right'; ctx.font='bold 24px sans-serif';
+  const myScore = s.scores ? s.scores[ui.mySeat] : 0;
+  ctx.fillStyle = myScore>=0 ? '#a5d6a7' : '#ef9a9a';
+  ctx.fillText(`我的积分 ${myScore>=0?'+':''}${myScore}`, W-26, 28);
   ctx.textBaseline='alphabetic';
 
   // 三家面板（右、上、左）
@@ -383,8 +387,8 @@ function renderGame(){
     ctx.fillText('⏱ '+Math.ceil(remain/1000)+'s', W/2, H*0.52+44);
   }
 
-  // 我的手牌
-  const hand = sortHand(s.hand, s.level);
+  // 我的手牌（理牌模式：点数 / 花色）
+  const hand = ui.sortMode==='suit' ? sortBySuit(s.hand, s.level) : sortHand(s.hand, s.level);
   const n = hand.length, cw=82, ch=116;
   const gap = n>1?Math.min(40,(W-160-cw)/(n-1)):0;
   const startX = (W-(cw+gap*(n-1)))/2, baseY = H-ch-26;
@@ -409,6 +413,11 @@ function renderGame(){
     btn('出 牌', W*0.5-95, H*0.55, 190, 68, doPlay, {color:'#f9a825',color2:'#f57f17',size:28});
     if(s.best) btn('过', W*0.84-85, H*0.55, 170, 68, ()=>{ api.send({type:'pass'}); ui.selected.clear(); ui.hintOpts=[]; }, {color:'#78909c',color2:'#546e7a',size:24});
   }
+  // 工具按钮行（理牌/同花顺/结束比赛）
+  const toolY = H*0.70;
+  btn(ui.sortMode==='value'?'🀄 按花色整理':'🀄 按点数整理', 40, toolY, 200, 52, ()=>{ ui.sortMode = ui.sortMode==='value'?'suit':'value'; }, {color:'#37474f',color2:'#263238',size:19,radius:26});
+  btn('🌈 一键同花顺', 260, toolY, 200, 52, showStraightFlush, {color:'#7b1fa2',color2:'#6a1b9a',size:19,radius:26});
+  btn('🏳 结束比赛', W-240, toolY, 200, 52, requestEndMatch, {color:'#c62828',color2:'#b71c1c',size:19,radius:26});
 }
 
 async function doHint(){
@@ -428,33 +437,158 @@ function doPlay(){
   ui.selected.clear(); ui.hintOpts=[];
 }
 
-// —— 输入 ——
+// —— 同花顺检测（客户端本地计算，用于一键查看/整理）——
+// 找出手牌里所有 5 张同花色连续点数的组合（含 A2345；逢人配不参与）
+function findStraightFlushes(hand, level){
+  const SEQ = ['2','3','4','5','6','7','8','9','T','J','Q','K','A'];
+  const out = [];
+  for(const suit of ['♠','♥','♣','♦']){
+    const ranks = new Set(hand.filter(c=>c.suit===suit && c.rank!=='BJ' && c.rank!=='SJ').map(c=>c.rank));
+    for(let i=0;i<=SEQ.length-5;i++){
+      const run = SEQ.slice(i,i+5);
+      if(run.every(r=>ranks.has(r))){
+        out.push(run.map(r=>hand.find(c=>c.suit===suit && c.rank===r)));
+      }
+    }
+    // A2345 特例
+    if(['A','2','3','4','5'].every(r=>ranks.has(r))){
+      out.push(['A','2','3','4','5'].map(r=>hand.find(c=>c.suit===suit && c.rank===r)));
+    }
+  }
+  return out;
+}
+
+// 按花色整理手牌（同花色聚在一起，便于发现同花顺）
+function sortBySuit(hand, level){
+  const suitOrder = {'♠':0,'♥':1,'♣':2,'♦':3,'X':4};
+  return hand.slice().sort((a,b)=>{
+    if(suitOrder[a.suit]!==suitOrder[b.suit]) return suitOrder[a.suit]-suitOrder[b.suit];
+    return val(a,level)-val(b,level);
+  });
+}
+
+// —— 一键同花顺：循环查看手牌中的同花顺并选中 ——
+function showStraightFlush(){
+  const s = ui.snap; if(!s) return;
+  const sfs = findStraightFlushes(s.hand, s.level);
+  if(!sfs.length) return toast('手中没有同花顺');
+  ui.sfIdx = (ui.sfIdx+1) % (sfs.length+1);
+  if(ui.sfIdx === sfs.length){ ui.selected.clear(); toast('同花顺查看完毕'); ui.sfIdx=-1; return; }
+  ui.selected = new Set(sfs[ui.sfIdx].map(c=>c.id));
+  ui.hintOpts=[];
+  toast(`同花顺 ${ui.sfIdx+1}/${sfs.length}：${sfs[ui.sfIdx][0].suit} ${sfs[ui.sfIdx].map(c=>({T:'10'}[c.rank]||c.rank)).join('')}`, 2200);
+}
+
+// —— 结束比赛：申请（原因选填）→ 全员投票，2人同意即结束回大厅 ——
+function requestEndMatch(){
+  let reason = '';
+  try{ reason = (prompt('申请提前结束比赛，原因（可不填）：') || '').slice(0,50); }catch{}
+  api.send({type:'end_request', reason});
+}
+function renderEndDialog(){
+  if(!ui.endDialog) return;
+  const d = ui.endDialog;
+  ctx.fillStyle='rgba(0,0,0,.6)'; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#1e2a24'; rr(W/2-330,H/2-160,660,320,24); ctx.fill();
+  ctx.strokeStyle='rgba(255,201,60,.6)'; ctx.lineWidth=2; rr(W/2-330,H/2-160,660,320,24); ctx.stroke();
+  ctx.fillStyle='#ffd54f'; ctx.font='bold 32px sans-serif'; ctx.textAlign='center';
+  ctx.fillText('提前结束比赛申请', W/2, H/2-100);
+  ctx.fillStyle='#fff'; ctx.font='24px sans-serif';
+  ctx.fillText(`${d.byName} 申请结束比赛${d.reason?`（${d.reason}）`:''}`, W/2, H/2-48);
+  const remain = Math.max(0, Math.ceil((d.expiresAt-Date.now())/1000));
+  ctx.fillStyle='rgba(255,255,255,.6)'; ctx.font='20px sans-serif';
+  ctx.fillText(`已有 ${d.votes}/2 人同意 · ${remain}秒后失效`, W/2, H/2-8);
+  if(d.votes>=2) return;
+  btn('同意结束', W/2-260, H/2+40, 240, 72, ()=>{ api.send({type:'end_vote',agree:true}); ui.endDialog=null; }, {color:'#66bb6a',color2:'#43a047',size:26});
+  btn('不同意', W/2+20, H/2+40, 240, 72, ()=>{ api.send({type:'end_vote',agree:false}); ui.endDialog=null; }, {color:'#78909c',color2:'#546e7a',size:26});
+}
+function renderVoteDialog(){ /* 由 endDialog 统一承载 */ }
+
+// —— 结算页（个人积分排名）——
+function renderResult(){
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#0f4a2e'); g.addColorStop(1,'#062016');
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#ffd54f'; ctx.font='bold 48px sans-serif'; ctx.textAlign='center';
+  ctx.fillText(ui.terminatedReason?'比赛提前结束':'整场比赛结束', W/2, 120);
+  const ranking = ui.finalRanking||[];
+  const medals=['🥇','🥈','🥉','4'];
+  ranking.forEach((p,i)=>{
+    const y = 210+i*86;
+    ctx.fillStyle='rgba(255,255,255,'+(i===0?0.14:0.06)+')'; rr(W/2-320,y,640,68,16); ctx.fill();
+    ctx.fillStyle='#fff'; ctx.font='bold 30px sans-serif'; ctx.textAlign='left';
+    ctx.fillText(`${medals[i]||i+1}  ${p.name||p.id}`, W/2-280, y+44);
+    ctx.textAlign='right'; ctx.font='bold 30px sans-serif';
+    ctx.fillStyle = p.score>=0?'#a5d6a7':'#ef9a9a';
+    ctx.fillText(`${p.score>=0?'+':''}${p.score} 级`, W/2+280, y+44);
+  });
+  btn('返回大厅', W/2-150, H-110, 300, 76, ()=>{ ui.scene='lobby'; ui.snap=null; ui.roomId=null; ui.finalRanking=null; ui.terminatedReason=null; refresh(); }, {color:'#2e9e5b',color2:'#1f7a43',size:28});
+}
+
+// —— 输入（点击 + 滑动多选）——
 function toCanvas(e){
   const r = cv.getBoundingClientRect();
-  const p = e.changedTouches?e.changedTouches[0]:e;
+  const p = e.changedTouches?e.changedTouches[0]:(e.touches&&e.touches[0]?e.touches[0]:e);
   return { x:(p.clientX-r.left)/r.width*W, y:(p.clientY-r.top)/r.height*H };
 }
-function onTap(e){
+function hitCard(x,y){
+  for(let i=ui.cardRects.length-1;i>=0;i--){
+    const r = ui.cardRects[i];
+    if(x>=r.x&&x<=r.x+r.w&&y>=r.y&&y<=r.y+r.h) return r;
+  }
+  return null;
+}
+// 拖拽状态：起点、拖动方向（选中/取消）、是否已构成拖动
+let drag = null;
+function onDown(e){
+  if(ui.scene!=='game') return;
   const {x,y} = toCanvas(e);
-  for(const b of ui.buttons) if(x>=b.x&&x<=b.x+b.w&&y>=b.y&&y<=b.y+b.h) return b.fn();
-  if(ui.scene==='game'){
-    for(let i=ui.cardRects.length-1;i>=0;i--){
-      const r = ui.cardRects[i];
-      if(x>=r.x&&x<=r.x+r.w&&y>=r.y&&y<=r.y+r.h){
-        ui.selected.has(r.id)?ui.selected.delete(r.id):ui.selected.add(r.id);
-        ui.hintOpts=[];
-        return;
+  const hit = hitCard(x,y);
+  if(!hit) return;
+  const mode = ui.selected.has(hit.id) ? 'unselect' : 'select';
+  drag = { startX:x, startY:y, mode, moved:false, anchorId:hit.id };
+}
+function onMove(e){
+  if(ui.scene!=='game') return;
+  const {x,y} = toCanvas(e);
+  if(drag){
+    if(Math.abs(x-drag.startX)>8 || Math.abs(y-drag.startY)>8) drag.moved = true;
+    if(drag.moved){
+      const hit = hitCard(x,y);
+      if(hit){
+        if(drag.mode==='select') ui.selected.add(hit.id);
+        else ui.selected.delete(hit.id);
+        if(hit.id!==drag.anchorId) ui.hintOpts=[];
       }
     }
   }
 }
-cv.addEventListener('click', onTap);
-cv.addEventListener('mousemove', e=>{ mouse = toCanvas(e); });
-cv.addEventListener('touchend', e=>{ e.preventDefault(); onTap(e); });
-cv.addEventListener('touchmove', e=>{ mouse = toCanvas(e); });
+function onUp(e){
+  const {x,y} = toCanvas(e);
+  if(ui.endDialog){ // 弹窗优先
+    for(const b of ui.buttons) if(x>=b.x&&x<=b.x+b.w&&y>=b.y&&y<=b.y+b.h) return b.fn();
+    return;
+  }
+  for(const b of ui.buttons) if(x>=b.x&&x<=b.x+b.w&&y>=b.y&&y<=b.y+b.h){ drag=null; return b.fn(); }
+  if(drag && !drag.moved && ui.scene==='game'){
+    // 单击切换选中
+    const hit = hitCard(x,y);
+    if(hit){
+      ui.selected.has(hit.id)?ui.selected.delete(hit.id):ui.selected.add(hit.id);
+      ui.hintOpts=[];
+    }
+  }
+  drag = null;
+}
+cv.addEventListener('mousedown', onDown);
+cv.addEventListener('mousemove', e=>{ mouse = toCanvas(e); onMove(e); });
+cv.addEventListener('mouseup', onUp);
+cv.addEventListener('touchstart', e=>{ onDown(e); }, {passive:true});
+cv.addEventListener('touchmove', e=>{ mouse = toCanvas(e); onMove(e); }, {passive:true});
+cv.addEventListener('touchend', e=>{ e.preventDefault(); onUp(e); });
 
 // —— 网络事件 ——
-api.on('welcome', d=>{ api.profile=d.profile; });
+api.on('welcome', d=>{ api.profile=d.profile; ui.myId=d.profile.id; });
 api.on('room_state', d=>{ ui.roomState=d; });
 api.on('queued', d=>toast(`排队中，第${d.position}位（共${d.waiting}人）`));
 api.on('game_start', d=>{
@@ -463,8 +597,13 @@ api.on('game_start', d=>{
   if(!d.reconnect) banner(`亮 ${d.snapshot.flip} → 打${d.snapshot.level} 拖${d.snapshot.tug}`, 3200);
 });
 api.on('snapshot', d=>{ ui.snap=d.snapshot; setTimer(d.snapshot); });
+api.on('end_proposal', d=>{
+  ui.endDialog = d;
+  if(d.votes>=2) ui.endDialog=null; // 已达成，等 match_over
+});
 api.on('events', d=>{
   for(const ev of d.events){
+    if(ev.type==='match_over') handleMatchOver(ev);
     if(ev.type==='finish' && ui.snap) banner(`${ui.snap.names[ev.seat]} ${['🏆头游','🥈二游','三游','末游'][ev.rank-1]}`, 2000);
     if(ev.type==='tug_locked') banner('🔒 头游纯拖牌！不可压制，接风队友', 2600);
     if(ev.type==='auto_play') toast('超时，系统已代出',1400);
@@ -474,13 +613,16 @@ api.on('events', d=>{
       ui.selected.clear(); ui.hintOpts=[];
     }
     if(ev.type==='next_round') banner(`第${ev.roundNum}副：亮牌定级 打${ev.level}`, 2400);
-    if(ev.type==='match_over'){
-      const win = ui.teamIdx===ev.winnerTeam;
-      banner(ev.winnerTeam===-1?'整场平局':(win?'🏆 你们赢了整场！':'整场结束，对方获胜'), 5000);
-      setTimeout(()=>{ ui.scene='lobby'; ui.snap=null; ui.roomId=null; refresh(); }, 4600);
-    }
   }
 });
+function handleMatchOver(ev){
+  ui.finalRanking = ev.ranking || [];
+  ui.terminatedReason = ev.terminated ? (ev.reason||'提前结束') : null;
+  ui.endDialog = null;
+  ui.scene='result';
+  refresh();
+}
+api.on('match_over', handleMatchOver); // 提前结束时为独立消息
 api.on('error', d=>{ toast(d.error); ui.selected.clear(); ui.hintOpts=[]; });
 function setTimer(s){ ui.deadline = (s && s.turn===ui.mySeat) ? (ui.deadline||Date.now()+TURN_MS) : null; }
 async function refresh(){

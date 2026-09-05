@@ -238,6 +238,35 @@ function handleMsg(member, msg) {
       ws.send({ type: 'left_room' });
       break;
     }
+    case 'end_request': {
+      const session = sessions.get(c.roomId);
+      if (!session || session.over) { ws.send({ type: 'error', error: '对局未开始' }); break; }
+      // 发起提前结束申请（申请人默认同意，需共2人同意）
+      session.endVote = {
+        by: member.id, byName: member.name,
+        reason: String(msg.reason || '').slice(0, 50),
+        votes: new Set([member.id]),
+        expiresAt: Date.now() + 60000,
+      };
+      broadcast(c.roomId, {
+        type: 'end_proposal', byName: member.name, reason: session.endVote.reason,
+        votes: 1, need: 2, expiresAt: session.endVote.expiresAt,
+      });
+      break;
+    }
+    case 'end_vote': {
+      const session = sessions.get(c.roomId);
+      if (!session || !session.endVote) break;
+      if (Date.now() > session.endVote.expiresAt) { session.endVote = null; break; }
+      if (msg.agree) session.endVote.votes.add(member.id);
+      broadcast(c.roomId, {
+        type: 'end_proposal', byName: session.endVote.byName, reason: session.endVote.reason,
+        votes: session.endVote.votes.size, need: 2, expiresAt: session.endVote.expiresAt,
+      });
+      if (session.endVote.votes.size >= 2) terminateMatch(c.roomId, '提前结束（' + session.endVote.votes.size + '人同意）');
+      else if (!msg.agree) ws.send({ type: 'error', error: '已记录你的不同意意见' });
+      break;
+    }
     default:
       ws.send({ type: 'error', error: 'unknown message type: ' + msg.type });
   }
@@ -346,8 +375,9 @@ function settleWallet(session, result) {
 
 function finishMatch(session) {
   clearTimeout(turnTimers.get(session.room.id));
-  store.logMatch(session.winnerTeam, session.match.roundNo, {
-    roundWins: session.match.roundWins,
+  const ranking = session.match.ranking();
+  store.logMatch(ranking[0] ? ranking[0].score : 0, session.match.roundNo, {
+    ranking: ranking.map(r => ({ id: r.id, score: r.score })),
   });
   for (const id of session.room.seats) {
     if (id && !String(id).startsWith('bot:')) {
@@ -355,6 +385,32 @@ function finishMatch(session) {
       if (m) { m.stats.matches++; store.bumpStats(m.id, m.stats); }
     }
   }
+}
+
+// 提前结束比赛：以当前个人积分定排名，不再结算本副，全员回大厅
+function terminateMatch(roomId, reason) {
+  const session = sessions.get(roomId);
+  const room = lobby.rooms.get(roomId);
+  if (!session || !room) return;
+  session.over = true;
+  session.endVote = null;
+  room.state = 'finished';
+  clearTimeout(turnTimers.get(roomId));
+  const names = session.seatNames();
+  const nameOf = {};
+  session.match.occupants.forEach((id, i) => nameOf[String(id)] = names[i]);
+  const ranking = session.match.ranking().map(r => ({ id: r.id, name: nameOf[String(r.id)], score: r.score }));
+  store.logMatch(ranking[0] ? ranking[0].score : 0, session.match.roundNo, { terminated: true, reason });
+  broadcast(roomId, { type: 'match_over', ranking, scores: session.match.scores(), terminated: true, reason });
+  // 全员回大厅
+  for (const id of room.seats) {
+    if (id && !String(id).startsWith('bot:')) {
+      const cc = clients.get(id);
+      if (cc) { cc.roomId = null; cc.seat = null; }
+    }
+  }
+  lobby.rooms.delete(roomId);
+  sessions.delete(roomId);
 }
 
 function broadcast(roomId, msg) {

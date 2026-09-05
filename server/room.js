@@ -98,6 +98,7 @@ export class GameSession {
     this.started = false;
     this.over = false;
     this.winnerTeam = null;
+    this.endVote = null;   // {by, byName, reason, votes:Set, expiresAt}
   }
 
   seatNames() {
@@ -232,12 +233,18 @@ export class GameSession {
     if (!r.finishedByPlay) r.finishedByPlay = {};
     const result = r.settle(r.finishedByPlay);
     const applied = this.match.applyResult(result);
-    const events = [{ type: 'round_result', result: { ...result, roundWins: this.match.roundWins.slice() } }];
+    const events = [{ type: 'round_result', result: { ...result, scores: this.match.scores() } }];
     if (this.match.matchOver) {
       this.over = true;
-      this.winnerTeam = this.match.winnerTeam;
       this.room.state = 'finished';
-      events.push({ type: 'match_over', winnerTeam: this.match.winnerTeam, roundWins: this.match.roundWins.slice() });
+      const names = this.seatNames();
+      const nameOf = {};
+      this.match.occupants.forEach((id, i) => nameOf[String(id)] = names[i]);
+      events.push({
+        type: 'match_over',
+        ranking: this.match.ranking().map(r => ({ id: r.id, name: nameOf[String(r.id)], score: r.score })),
+        scores: this.match.scores(),
+      });
     } else {
       // 下一副（会重新发牌、亮牌、重排座位）
       this.nextRound();
@@ -298,7 +305,7 @@ export class GameSession {
           }
         : null,
       finishOrder: r.finishOrder,
-      roundWins: this.match.roundWins,
+      scores: this.match.scores(),
       tribute: r.tributeInfo || null,
     };
   }

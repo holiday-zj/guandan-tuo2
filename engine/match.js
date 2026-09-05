@@ -31,6 +31,7 @@ export function seatPermutation(teamOf) {
 
 export class Match {
   // occupants: 初始座位上的玩家标识（memberId 或 'bot:N'），长度4
+  // 积分绑定到个人（每副牌队伍都可能变化，不存在队伍累计分）
   constructor(occupants, opts = {}) {
     this.occupants = occupants.slice();   // 当前引擎座位序（每副牌可能重排）
     this.rng = opts.rng || Math.random;
@@ -41,9 +42,20 @@ export class Match {
     this.lastTeamOf = null;
     this.round = null;
     this.matchOver = false;
-    this.winnerTeam = null;               // -1 表示平局
-    this.roundWins = [0, 0];              // 各队赢的副数
-    this.netLevels = [0, 0];              // 各队累计级数差（仅供展示/平局参考）
+    this.scoresByPlayer = new Map();      // 玩家标识 -> 个人积分（级数累计，可负）
+    occupants.forEach(id => this.scoresByPlayer.set(id, 0));
+  }
+
+  // 个人积分（按当前引擎座位序对齐）
+  scores() {
+    return this.occupants.map(id => this.scoresByPlayer.get(id) || 0);
+  }
+
+  // 个人排名（积分从高到低）
+  ranking() {
+    return this.occupants
+      .map(id => ({ id, score: this.scoresByPlayer.get(id) || 0 }))
+      .sort((a, b) => b.score - a.score);
   }
 
   // 开始新一副牌：发牌 → 亮牌定级定队 → 重排座位（队友对角）→ 进贡
@@ -96,19 +108,21 @@ export class Match {
     return bj >= 2;
   }
 
-  // 本副结算入账（不升级，只记副数与级数差）
+  // 本副结算入账（积分归个人：赢家每人 +total，输家每人 -total）
   applyResult(result) {
-    this.roundWins[result.winTeam]++;
-    this.netLevels[result.winTeam] += result.total;
-    this.netLevels[1 - result.winTeam] -= result.total;
+    for (const s of result.winners) {
+      const id = this.occupants[s];
+      this.scoresByPlayer.set(id, (this.scoresByPlayer.get(id) || 0) + result.total);
+    }
+    for (const s of result.losers) {
+      const id = this.occupants[s];
+      this.scoresByPlayer.set(id, (this.scoresByPlayer.get(id) || 0) - result.total);
+    }
     this.lastTeamOf = this.round.teamOf.slice();
     this.lastResult = { ...result, roundNo: this.roundNo };
     this.history.push({ roundNo: this.roundNo, level: this.round.level, result: this.lastResult });
     if (this.roundNo >= this.totalRounds) {
       this.matchOver = true;
-      this.winnerTeam = this.roundWins[0] === this.roundWins[1]
-        ? -1
-        : (this.roundWins[0] > this.roundWins[1] ? 0 : 1);
     }
     return this.lastResult;
   }
@@ -117,11 +131,10 @@ export class Match {
     return {
       roundNo: this.roundNo,
       totalRounds: this.totalRounds,
-      roundWins: this.roundWins.slice(),
+      scores: this.scores(),
       teamOf: this.round ? this.round.teamOf : null,
       level: this.round ? this.round.level : null,
       matchOver: this.matchOver,
-      winnerTeam: this.winnerTeam,
     };
   }
 }

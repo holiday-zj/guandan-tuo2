@@ -20,6 +20,8 @@
 | 拖牌奖励：双上时头游+二游末手纯拖均计分，否则仅头游；普通拖+1/张，红桃拖+2/张 | `Round.settle()` |
 | 末游惩罚：仅末游剩余拖牌每张+1级；双下时三游+末游全算 | `Round.settle()` |
 | **总分封顶13级**，超出作废 | `Round.settle()` |
+| 积分绑定个人：每副赢家+级数、输家−级数（队伍每副可变，无队伍累计分） | `Match.applyResult()` |
+| 提前结束：申请（原因选填）→ 2人同意即终止，按当前个人积分排名，回大厅 | `server/index.js terminateMatch()` |
 | 结算：输家每人付 总级数×底注 | `store.settleCoins()` |
 
 ## 测试
@@ -76,6 +78,8 @@ WebSocket：`ws://host/?token=***
 - `{type:'start_game'}` 房主开局
 - `{type:'play', cards:[{id}]}` 出牌 / `{type:'pass'}` 过牌
 - `{type:'hint'}` 请求出牌提示（返回最多8种候选）
+- `{type:'end_request', reason}` 申请提前结束比赛（原因选填）
+- `{type:'end_vote', agree}` 对结束申请投票（2人同意即生效）
 - `{type:'leave_room'}` / `{type:'ping'}`
 
 服务端 → 客户端：
@@ -84,6 +88,8 @@ WebSocket：`ws://host/?token=***
 - `events [...]` — play/pass/finish/auto_play/new_trick/round_result/next_round/match_over
 - `snapshot` — 每步后的最新状态
 - `hint {options}` — 提示候选
+- `end_proposal` — 结束申请广播（含票数/倒计时）
+- `match_over {ranking, terminated}` — 整场结束/提前结束（个人积分排名）
 
 ### 服务端特性
 
