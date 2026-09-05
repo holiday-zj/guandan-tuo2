@@ -65,7 +65,7 @@ const api = {
 // —— 状态 ——
 const ui = { scene:'login', mySeat:null, myId:null, snap:null, roomId:null, roomState:null,
   selected:new Set(), buttons:[], cardRects:[], toast:null, deadline:null,
-  hintOpts:[], hintIdx:0, sfIdx:0, lastHandKey:null, sortMode:'value',
+  hintOpts:[], hintIdx:0, sfIdx:0, lastHandKey:null, sortMode:'suit',
   teamIdx:0, hoverCard:null, banner:null, finalRanking:null, terminatedReason:null,
   endDialog:null, voteDialog:null };
 const TURN_MS = 30000;
@@ -157,7 +157,7 @@ function drawCard(c,x,y,w,h,o={}){
   ctx.textAlign='left';
 }
 
-// —— 玩家面板 ——
+// —— 玩家信息面板（参考成熟掼蛋游戏：头像+昵称+积分+状态）——
 function playerPanel(x,y,seat,o={}){
   const s = ui.snap;
   const name = s? s.names[seat] : '?';
@@ -165,34 +165,69 @@ function playerPanel(x,y,seat,o={}){
   const partner = s && !isMe && s.teamOf[seat]===s.teamOf[ui.mySeat];
   const finished = s && s.finishOrder.includes(seat);
   const isTurn = s && s.turn===seat && !finished;
-  const R = 34;
+  const score = s && s.scores ? s.scores[seat] : 0;
+  const pw = o.width||270, ph = 64;
+  // 面板底
+  ctx.fillStyle='rgba(0,0,0,.42)'; rr(x,y,pw,ph,14); ctx.fill();
+  if(isTurn){ ctx.strokeStyle='#ffc93c'; ctx.lineWidth=2.5; rr(x,y,pw,ph,14); ctx.stroke(); }
   // 头像
-  if(isTurn){ ctx.save(); ctx.shadowColor='#ffc93c'; ctx.shadowBlur=18; }
-  ctx.beginPath(); ctx.arc(x,y,R,0,Math.PI*2);
+  ctx.beginPath(); ctx.arc(x+32,y+ph/2,24,0,Math.PI*2);
   ctx.fillStyle = AVATAR_BG[seat%4]; ctx.fill();
-  if(isTurn) ctx.restore();
-  ctx.lineWidth=3; ctx.strokeStyle = isMe?'#ffc93c':(partner?'#81c784':'rgba(255,255,255,.35)');
-  ctx.beginPath(); ctx.arc(x,y,R,0,Math.PI*2); ctx.stroke();
-  ctx.fillStyle='#fff'; ctx.font='bold 26px sans-serif'; ctx.textAlign='center';
-  ctx.fillText(finished?'✓':name.slice(0,1), x, y+9);
-  // 名字 + 身份
-  ctx.font='20px sans-serif';
-  ctx.fillStyle = isMe?'#ffc93c':(partner?'#a5d6a7':'#e0e0e0');
-  const tag = isMe?'（我）':(partner?'·队友':'');
-  ctx.fillText(name+tag, x, y+R+26);
-  // 剩余牌数 / 名次
-  if(s){
-    if(finished){
-      const rk = s.finishOrder.indexOf(seat)+1;
-      ctx.fillStyle='#ffc93c'; ctx.font='bold 18px sans-serif';
-      ctx.fillText(['🏆头游','🥈二游','三游','末游'][rk-1], x, y+R+52);
-    } else {
-      ctx.fillStyle='rgba(0,0,0,.35)'; rr(x-34,y+R+38,68,26,13); ctx.fill();
-      ctx.fillStyle='#fff'; ctx.font='16px sans-serif';
-      ctx.fillText(s.handCounts[seat]+' 张', x, y+R+56);
-      if(isTurn){ ctx.fillStyle='#ffc93c'; ctx.font='15px sans-serif'; ctx.fillText('出牌中…', x, y+R+82); }
-    }
+  ctx.lineWidth=2.5; ctx.strokeStyle = isMe?'#ffc93c':(partner?'#81c784':'rgba(255,255,255,.4)');
+  ctx.beginPath(); ctx.arc(x+32,y+ph/2,24,0,Math.PI*2); ctx.stroke();
+  ctx.fillStyle='#fff'; ctx.font='bold 20px sans-serif'; ctx.textAlign='center';
+  ctx.fillText(finished?'✓':name.slice(0,1), x+32, y+ph/2+7);
+  // 昵称 + 队友标
+  ctx.textAlign='left';
+  ctx.font='bold 19px sans-serif';
+  ctx.fillStyle = isMe?'#ffc93c':'#fff';
+  const tag = isMe?'（我）':(partner?'（队友）':'');
+  ctx.fillText(name.slice(0,6)+tag, x+64, y+26);
+  // 积分
+  ctx.font='16px sans-serif';
+  ctx.fillStyle = score>=0?'#a5d6a7':'#ef9a9a';
+  ctx.fillText(`积分 ${score>=0?'+':''}${score}`, x+64, y+50);
+  // 状态
+  ctx.textAlign='right'; ctx.font='bold 17px sans-serif';
+  if(finished){
+    const rk = s.finishOrder.indexOf(seat)+1;
+    ctx.fillStyle='#ffc93c';
+    ctx.fillText(['头游','二游','三游','末游'][rk-1], x+pw-14, y+26);
+    ctx.fillStyle='rgba(255,255,255,.55)'; ctx.font='14px sans-serif';
+    ctx.fillText('已出完', x+pw-14, y+50);
+  } else {
+    ctx.fillStyle='rgba(255,255,255,.75)';
+    ctx.fillText(s.handCounts[seat]+'张', x+pw-14, y+26);
+    if(isTurn){ ctx.fillStyle='#ffc93c'; ctx.font='14px sans-serif'; ctx.fillText('思考中', x+pw-14, y+50); }
   }
+  ctx.textAlign='left';
+}
+
+// 倒计时（画在指定位置，参考截图的大数字倒计时）
+function drawCountdown(x,y){
+  const s = ui.snap; if(!s || !s.turnDeadline) return;
+  const remain = Math.max(0, Math.ceil((s.turnDeadline-Date.now())/1000));
+  ctx.fillStyle='rgba(0,0,0,.55)'; rr(x-30,y-24,60,48,12); ctx.fill();
+  ctx.fillStyle = remain<=10?'#ef5350':'#ffc93c';
+  ctx.font='bold 30px sans-serif'; ctx.textAlign='center';
+  ctx.fillText(remain, x, y+10);
+}
+
+// 某家最近出的牌（或"不出"），画在 (x, y)
+function drawPlayArea(seat, x, y){
+  const s = ui.snap; if(!s || !s.lastPlays) return;
+  const lp = s.lastPlays[seat];
+  if(!lp) return;
+  if(lp.pass){
+    ctx.fillStyle='rgba(0,0,0,.5)'; rr(x-40,y-2,80,36,18); ctx.fill();
+    ctx.fillStyle='rgba(255,255,255,.85)'; ctx.font='20px sans-serif'; ctx.textAlign='center';
+    ctx.fillText('不 出', x, y+23);
+    return;
+  }
+  const cards = lp.cards;
+  const cw=46, ch=64, gap=10;
+  const totalW = cards.length*cw+(cards.length-1)*gap;
+  cards.forEach((c,i)=> drawCard(c, x-totalW/2+i*(cw+gap), y, cw, ch, {}));
 }
 
 // —— 场景 ——
@@ -336,62 +371,73 @@ function renderRoom(){
 function renderGame(){
   tableBg();
   const s = ui.snap; if(!s) return;
-  // 顶部信息条
-  ctx.fillStyle='rgba(0,0,0,.45)'; rr(0,0,W,54,0); ctx.fill();
-  ctx.font='24px sans-serif'; ctx.textBaseline='middle';
+  // 顶部信息条（精简）
+  ctx.fillStyle='rgba(0,0,0,.45)'; ctx.fillRect(0,0,W,44);
+  ctx.font='22px sans-serif'; ctx.textBaseline='middle';
   ctx.fillStyle='#fff'; ctx.textAlign='left';
-  ctx.fillText(`第 ${s.roundNum}/${s.totalRounds} 副`, 26, 28);
-  // 亮牌/打几/拖几 徽章
+  ctx.fillText(`第 ${s.roundNum}/${s.totalRounds} 副`, 24, 23);
   const chips = [['亮', s.flip||'-'], ['打', s.level], ['拖', s.tug]];
-  let cx = 200;
+  let cx = 180;
   for(const [k,v] of chips){
-    ctx.fillStyle='rgba(255,255,255,.12)'; rr(cx,10,120,34,17); ctx.fill();
-    ctx.fillStyle='#ffd54f'; ctx.font='bold 22px sans-serif'; ctx.textAlign='left';
-    ctx.fillText(k, cx+16, 28);
-    ctx.fillStyle='#fff'; ctx.textAlign='right'; ctx.fillText(v, cx+106, 28);
-    cx += 136;
+    ctx.fillStyle='rgba(255,255,255,.12)'; rr(cx,7,110,30,15); ctx.fill();
+    ctx.fillStyle='#ffd54f'; ctx.font='bold 20px sans-serif'; ctx.textAlign='left';
+    ctx.fillText(k, cx+14, 23);
+    ctx.fillStyle='#fff'; ctx.textAlign='right'; ctx.fillText(v, cx+96, 23);
+    cx += 124;
   }
-  // 个人积分（积分绑定到个人，非队伍）
-  ctx.textAlign='right'; ctx.font='bold 24px sans-serif';
+  ctx.textAlign='right'; ctx.font='bold 22px sans-serif';
   const myScore = s.scores ? s.scores[ui.mySeat] : 0;
   ctx.fillStyle = myScore>=0 ? '#a5d6a7' : '#ef9a9a';
-  ctx.fillText(`我的积分 ${myScore>=0?'+':''}${myScore}`, W-26, 28);
+  ctx.fillText(`积分 ${myScore>=0?'+':''}${myScore}`, W-24, 23);
   ctx.textBaseline='alphabetic';
 
-  // 三家面板（右、上、左）
-  const rel = [1,2,3].map(r=>(ui.mySeat+r)%4);
-  playerPanel(W-110, H*0.34, rel[0]);
-  playerPanel(W/2, 160, rel[1]);
-  playerPanel(110, H*0.34, rel[2]);
+  // —— 四家面板 + 各自出牌区（参考截图布局）——
+  const rel = [1,2,3].map(r=>(ui.mySeat+r)%4); // 右、上、左
+  const rightSeat = rel[0], topSeat = rel[1], leftSeat = rel[2];
 
-  // 桌面：当前最大牌
-  if(s.best){
-    const n = s.best.cards.length;
-    const cw=54, gap=16, totalW=n*cw+(n-1)*gap;
-    const bx = W/2-totalW/2, by = H*0.34;
-    ctx.save(); ctx.globalAlpha=.95;
-    s.best.cards.forEach((c,i)=> drawCard(c, bx+i*(cw+gap), by, cw, 76, {}));
-    ctx.restore();
-    ctx.fillStyle='rgba(0,0,0,.5)'; rr(W/2-150, by+84, 300, 30, 15); ctx.fill();
-    ctx.fillStyle='#ffe082'; ctx.font='18px sans-serif'; ctx.textAlign='center';
-    ctx.fillText(seatName(s.best.by)+' 出的牌', W/2, by+105);
+  // 上家（队友，顶部中央）
+  playerPanel(W/2-135, 54, topSeat);
+  if(s.turn===topSeat) drawCountdown(W/2+180, 86);
+  drawPlayArea(topSeat, W/2, 130);
+
+  // 左家
+  playerPanel(16, 210, leftSeat);
+  if(s.turn===leftSeat) drawCountdown(320, 242);
+  drawPlayArea(leftSeat, 300, 300);
+
+  // 右家
+  playerPanel(W-286, 210, rightSeat, {});
+  if(s.turn===rightSeat) drawCountdown(W-320, 242);
+  drawPlayArea(rightSeat, W-300, 300);
+
+  // 我的出牌区（中央偏上）
+  drawPlayArea(ui.mySeat, W/2, 250);
+  if(s.turn===ui.mySeat) drawCountdown(W/2, 210);
+
+  // —— 手牌区 ——
+  if(ui.sortMode==='suit') renderHandBySuit(s);   // 花色分行（默认，好看同花顺）
+  else renderHandSingle(s);                        // 点数单行
+
+  // —— 右侧工具栏 ——
+  const tx = W-190, ty0 = 380;
+  const myTurn = s.turn===ui.mySeat && !s.finishOrder.includes(ui.mySeat);
+  let ty = ty0;
+  btn(ui.sortMode==='suit'?'🀄 按点数':'🀄 按花色', tx, ty, 170, 50, ()=>{ ui.sortMode = ui.sortMode==='value'?'suit':'value'; }, {color:'#37474f',color2:'#263238',size:18,radius:25}); ty += 60;
+  btn('🌈 同花顺', tx, ty, 170, 50, showStraightFlush, {color:'#7b1fa2',color2:'#6a1b9a',size:18,radius:25}); ty += 60;
+  if(myTurn){
+    btn('💡 提示', tx, ty, 170, 50, doHint, {color:'#546e7a',color2:'#37474f',size:18,radius:25}); ty += 60;
+    btn('出 牌', tx, ty, 170, 56, doPlay, {color:'#f9a825',color2:'#f57f17',size:22,radius:28}); ty += 66;
+    if(s.best){ btn('过', tx, ty, 170, 50, ()=>{ api.send({type:'pass'}); ui.selected.clear(); ui.hintOpts=[]; }, {color:'#78909c',color2:'#546e7a',size:18,radius:25}); ty += 60; }
   }
+  btn('🏳 结束', tx, ty, 170, 50, requestEndMatch, {color:'#c62828',color2:'#b71c1c',size:18,radius:25});
+}
 
-  // 倒计时条
-  if(s.turn===ui.mySeat && ui.deadline){
-    const remain = Math.max(0, ui.deadline-Date.now()), pct = remain/TURN_MS;
-    ctx.fillStyle='rgba(0,0,0,.4)'; rr(W/2-200,H*0.52,400,14,7); ctx.fill();
-    const tc = pct>.3?'#66bb6a':'#ef5350';
-    ctx.fillStyle=tc; rr(W/2-200,H*0.52,Math.max(8,400*pct),14,7); ctx.fill();
-    ctx.fillStyle='#fff'; ctx.font='bold 20px sans-serif'; ctx.textAlign='center';
-    ctx.fillText('⏱ '+Math.ceil(remain/1000)+'s', W/2, H*0.52+44);
-  }
-
-  // 我的手牌（理牌模式：点数 / 花色）
-  const hand = ui.sortMode==='suit' ? sortBySuit(s.hand, s.level) : sortHand(s.hand, s.level);
-  const n = hand.length, cw=82, ch=116;
-  const gap = n>1?Math.min(40,(W-160-cw)/(n-1)):0;
-  const startX = (W-(cw+gap*(n-1)))/2, baseY = H-ch-26;
+// 手牌单行渲染（按点数排序）
+function renderHandSingle(s){
+  const hand = sortHand(s.hand, s.level);
+  const n = hand.length, cw=64, ch=90;
+  const gap = n>1?Math.min(34,(W-190-160-cw)/(n-1)):0;
+  const startX = 150, baseY = H-ch-20;
   ui.cardRects=[];
   ui.hoverCard=null;
   hand.forEach((c,i)=>{
@@ -399,25 +445,61 @@ function renderGame(){
     const sel = ui.selected.has(c.id);
     const wild = c.suit==='♥'&&c.rank===s.level;
     const hl = ui.hintOpts[ui.hintIdx] && ui.hintOpts[ui.hintIdx].some(h=>h.id===c.id);
-    const hover = mouse.x>=x&&mouse.x<=x+cw&&mouse.y>=baseY-22&&mouse.y<=baseY+ch;
+    const hover = mouse.x>=x&&mouse.x<=x+cw&&mouse.y>=baseY-18&&mouse.y<=baseY+ch;
     if(hover && !sel) ui.hoverCard = c.id;
     drawCard(c,x,baseY,cw,ch,{sel,wild,hl});
-    if(hover && !sel){ ctx.save(); ctx.globalAlpha=.35; ctx.strokeStyle='#fff'; ctx.lineWidth=2; rr(x,baseY,cw,ch,9); ctx.stroke(); ctx.restore(); }
-    ui.cardRects.push({x,y:baseY-(sel?22:0),w:cw,h:ch,id:c.id});
+    if(hover && !sel){ ctx.save(); ctx.globalAlpha=.35; ctx.strokeStyle='#fff'; ctx.lineWidth=2; rr(x,baseY,cw,ch,8); ctx.stroke(); ctx.restore(); }
+    ui.cardRects.push({x,y:baseY-(sel?18:0),w:cw,h:ch,id:c.id});
+  });
+}
+
+// 手牌按花色分行渲染：每花色一行，行内按点数升序，方便目视同花顺
+function renderHandBySuit(s){
+  const level = s.level;
+  const groups = new Map(); // suit -> cards[]
+  for(const c of s.hand){
+    if(!groups.has(c.suit)) groups.set(c.suit, []);
+    groups.get(c.suit).push(c);
+  }
+  const suitOrder = ['♠','♥','♣','♦','X'];
+  const rows = suitOrder.filter(su=>groups.has(su)).map(su=>{
+    const cards = groups.get(su).slice().sort((a,b)=>val(a,level)-val(b,level));
+    return { suit: su, cards };
   });
 
-  // 操作按钮
-  const myTurn = s.turn===ui.mySeat && !s.finishOrder.includes(ui.mySeat);
-  if(myTurn){
-    btn('💡 提示', W*0.16-85, H*0.55, 170, 68, doHint, {color:'#546e7a',color2:'#37474f',size:24});
-    btn('出 牌', W*0.5-95, H*0.55, 190, 68, doPlay, {color:'#f9a825',color2:'#f57f17',size:28});
-    if(s.best) btn('过', W*0.84-85, H*0.55, 170, 68, ()=>{ api.send({type:'pass'}); ui.selected.clear(); ui.hintOpts=[]; }, {color:'#78909c',color2:'#546e7a',size:24});
-  }
-  // 工具按钮行（理牌/同花顺/结束比赛）
-  const toolY = H*0.70;
-  btn(ui.sortMode==='value'?'🀄 按花色整理':'🀄 按点数整理', 40, toolY, 200, 52, ()=>{ ui.sortMode = ui.sortMode==='value'?'suit':'value'; }, {color:'#37474f',color2:'#263238',size:19,radius:26});
-  btn('🌈 一键同花顺', 260, toolY, 200, 52, showStraightFlush, {color:'#7b1fa2',color2:'#6a1b9a',size:19,radius:26});
-  btn('🏳 结束比赛', W-240, toolY, 200, 52, requestEndMatch, {color:'#c62828',color2:'#b71c1c',size:19,radius:26});
+  const handX = 150, handW = W-190-150-30;
+  const rowH = 74, cardW = 56, cardH = 74;
+  const totalH = rows.length*rowH;
+  const startY = Math.max(368, H - totalH - 18);
+
+  ui.cardRects = [];
+  ui.hoverCard = null;
+  rows.forEach((row, ri)=>{
+    const y = startY + ri*rowH;
+    // 行首花色标记
+    if(row.suit!=='X'){
+      ctx.fillStyle = SUIT_COLOR[row.suit];
+      ctx.font='bold 26px sans-serif'; ctx.textAlign='center';
+      ctx.fillText(row.suit, handX-56, y+cardH/2+9);
+    } else {
+      ctx.fillStyle='#c62828'; ctx.font='bold 18px sans-serif'; ctx.textAlign='center';
+      ctx.fillText('王', handX-56, y+cardH/2+6);
+    }
+    // 行内卡牌
+    const n = row.cards.length;
+    const gap = n>1 ? Math.min(30,(handW-cardW)/(n-1)) : 0;
+    row.cards.forEach((c,i)=>{
+      const x = handX + i*gap;
+      const sel = ui.selected.has(c.id);
+      const wild = c.suit==='♥'&&c.rank===level;
+      const hl = ui.hintOpts[ui.hintIdx] && ui.hintOpts[ui.hintIdx].some(h=>h.id===c.id);
+      const hover = mouse.x>=x&&mouse.x<=x+cardW&&mouse.y>=y-14&&mouse.y<=y+cardH;
+      if(hover && !sel) ui.hoverCard = c.id;
+      drawCard(c,x,y,cardW,cardH,{sel,wild,hl});
+      if(hover && !sel){ ctx.save(); ctx.globalAlpha=.35; ctx.strokeStyle='#fff'; ctx.lineWidth=2; rr(x,y,cardW,cardH,7); ctx.stroke(); ctx.restore(); }
+      ui.cardRects.push({x,y:y-(sel?14:0),w:cardW,h:cardH,id:c.id});
+    });
+  });
 }
 
 async function doHint(){
@@ -624,7 +706,7 @@ function handleMatchOver(ev){
 }
 api.on('match_over', handleMatchOver); // 提前结束时为独立消息
 api.on('error', d=>{ toast(d.error); ui.selected.clear(); ui.hintOpts=[]; });
-function setTimer(s){ ui.deadline = (s && s.turn===ui.mySeat) ? (ui.deadline||Date.now()+TURN_MS) : null; }
+function setTimer(s){ ui.deadline = (s && s.turn===ui.mySeat) ? (s.turnDeadline||ui.deadline||Date.now()+TURN_MS) : null; }
 async function refresh(){
   const name = localStorage.getItem('gd_name'); if(!name) return;
   try{ const r = await api.post('/api/login',{name,password:'guest'}); if(r.ok){ api.profile=r.profile; api.token=r.token; } }catch{}

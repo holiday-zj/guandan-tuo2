@@ -205,6 +205,8 @@ function handleMsg(member, msg) {
         opts = followOptions(r.hands[seat], r.level, session.driver.best.it, 8);
       } else {
         opts = leadOptions(r.hands[seat], r.level, 8);
+        // 首攻禁拖：排除纯拖牌的领出候选
+        if (!r.led) opts = opts.filter(o => !o.cards.every(c => c.rank === r.tug));
       }
       ws.send({ type: 'hint', options: opts.map(o => o.cards.map(card => ({ id: card.id, suit: card.suit, rank: card.rank }))) });
       break;

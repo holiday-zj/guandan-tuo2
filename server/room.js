@@ -99,6 +99,8 @@ export class GameSession {
     this.over = false;
     this.winnerTeam = null;
     this.endVote = null;   // {by, byName, reason, votes:Set, expiresAt}
+    this.lastPlays = {};   // seat -> {pass} 或 {cards:[...]} 当前圈内各家最近动作
+    this.turnStartedAt = Date.now();
   }
 
   seatNames() {
@@ -139,6 +141,8 @@ export class GameSession {
       consecutivePasses: 0,
       turn: lead,
     };
+    this.lastPlays = {};
+    this.turnStartedAt = Date.now();
     return info;
   }
 
@@ -158,6 +162,7 @@ export class GameSession {
     if (action.type === 'pass') {
       if (!d.best) return { ok: false, error: '领出不能过' };
       d.consecutivePasses++;
+      this.lastPlays[seat] = { pass: true };
       events.push({ type: 'pass', seat });
       const needPasses = this.activeCount() - (this.active(d.best.by) ? 1 : 0);
       if (d.consecutivePasses >= needPasses) {
@@ -179,6 +184,8 @@ export class GameSession {
 
     d.best = { cards, it: ev.play, by: seat };
     d.consecutivePasses = 0;
+    this.lastPlays[seat] = { pass: false, cards: cards.map(c => ({ id: c.id, suit: c.suit, rank: c.rank })) };
+    this.turnStartedAt = Date.now();
     events.push({
       type: 'play', seat,
       cards: cards.map(cardLabel),
@@ -205,6 +212,7 @@ export class GameSession {
     for (let i = 0; i < 4; i++, s = (s + 1) % 4) if (this.active(s)) break;
     d.turn = s;
     this.match.round.lead = s;
+    this.turnStartedAt = Date.now();
   }
 
   endTrick() {
@@ -224,6 +232,8 @@ export class GameSession {
     d.turn = next;
     r.lead = next;
     r.trick = null; // 关键：清空引擎层的当前牌圈，否则下一圈领出会被旧牌圈压制判定卡住
+    this.lastPlays = {}; // 新一圈清空各家出牌展示
+    this.turnStartedAt = Date.now();
     events.push({ type: 'new_trick', lead: next });
     return events;
   }
@@ -306,6 +316,8 @@ export class GameSession {
         : null,
       finishOrder: r.finishOrder,
       scores: this.match.scores(),
+      lastPlays: this.lastPlays,
+      turnDeadline: this.turnStartedAt + 30000,
       tribute: r.tributeInfo || null,
     };
   }
