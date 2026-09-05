@@ -71,6 +71,112 @@ const ui = { scene:'login', mySeat:null, myId:null, snap:null, roomId:null, room
 const TURN_MS = 30000;
 let mouse = {x:-1,y:-1};
 
+// —— 音效引擎（Web Audio 合成，无需音频文件）——
+const audio = {
+  ctx:null, enabled: localStorage.getItem('gd_mute')!=='1',
+  init(){
+    if(this.ctx){ if(this.ctx.state==='suspended') this.ctx.resume(); return; }
+    try{ this.ctx = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){}
+  },
+  tone(freq,dur,{type='sine',vol=0.15,delay=0,slide=0}={}){
+    if(!this.enabled||!this.ctx) return;
+    const t0=this.ctx.currentTime+delay;
+    const o=this.ctx.createOscillator(), g=this.ctx.createGain();
+    o.type=type; o.frequency.setValueAtTime(freq,t0);
+    if(slide) o.frequency.exponentialRampToValueAtTime(Math.max(30,freq+slide),t0+dur);
+    g.gain.setValueAtTime(vol,t0);
+    g.gain.exponentialRampToValueAtTime(0.001,t0+dur);
+    o.connect(g); g.connect(this.ctx.destination);
+    o.start(t0); o.stop(t0+dur+0.02);
+  },
+  noise(dur,{vol=0.2,delay=0,filter=800,q=1}={}){
+    if(!this.enabled||!this.ctx) return;
+    const t0=this.ctx.currentTime+delay;
+    const len=Math.max(1,Math.floor(this.ctx.sampleRate*dur));
+    const buf=this.ctx.createBuffer(1,len,this.ctx.sampleRate);
+    const d=buf.getChannelData(0);
+    for(let i=0;i<len;i++) d[i]=(Math.random()*2-1)*(1-i/len);
+    const src=this.ctx.createBufferSource(); src.buffer=buf;
+    const bp=this.ctx.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=filter; bp.Q.value=q;
+    const g=this.ctx.createGain(); g.gain.setValueAtTime(vol,t0); g.gain.exponentialRampToValueAtTime(0.001,t0+dur);
+    src.connect(bp); bp.connect(g); g.connect(this.ctx.destination);
+    src.start(t0);
+  },
+  click(){ this.tone(1100,0.04,{type:'square',vol:0.05}); },
+  playCard(){ this.noise(0.07,{vol:0.3,filter:1600}); this.tone(220,0.06,{type:'triangle',vol:0.12,slide:-90}); },
+  pass(){ this.tone(420,0.09,{type:'sine',vol:0.09,slide:-120}); },
+  bomb(){ this.noise(0.5,{vol:0.55,filter:140,q:0.5}); this.tone(95,0.45,{type:'sine',vol:0.5,slide:-55}); this.tone(58,0.5,{type:'triangle',vol:0.35,slide:-25,delay:0.03}); },
+  kings(){ this.bomb(); this.tone(1300,0.35,{type:'sawtooth',vol:0.12,slide:700,delay:0.05}); this.noise(0.8,{vol:0.4,filter:300,q:0.3,delay:0.12}); },
+  turn(){ this.tone(880,0.12,{type:'sine',vol:0.16}); this.tone(660,0.16,{type:'sine',vol:0.16,delay:0.13}); },
+  finish(){ this.tone(523,0.1,{vol:0.13}); this.tone(659,0.1,{vol:0.13,delay:0.08}); this.tone(784,0.16,{vol:0.13,delay:0.16}); },
+  win(){ [523,659,784,1047].forEach((f,i)=>this.tone(f,0.18,{vol:0.17,delay:i*0.1})); },
+  lose(){ [400,330,262].forEach((f,i)=>this.tone(f,0.22,{type:'triangle',vol:0.13,delay:i*0.13})); },
+  fanfare(){ [523,659,784,1047,784,1047,1319].forEach((f,i)=>this.tone(f,0.24,{vol:0.18,delay:i*0.14})); },
+  deal(){ for(let i=0;i<9;i++) this.noise(0.03,{vol:0.09,filter:1800+Math.random()*1600,delay:i*0.04}); },
+  tick(){ this.tone(1000,0.05,{type:'square',vol:0.09}); },
+};
+
+// —— 视觉特效：粒子/震屏/闪光 ——
+const fx = {
+  particles:[], shakeMag:0, shakeUntil:0, offX:0, offY:0,
+  flashColor:null, flashUntil:0, flashDur:300, lastTickSec:null,
+  burst(x,y,n,colors,o={}){
+    for(let i=0;i<n;i++){
+      const a=Math.random()*Math.PI*2, sp=(o.speed||6)*(0.4+Math.random()*0.8);
+      this.particles.push({
+        x,y, vx:Math.cos(a)*sp, vy:Math.sin(a)*sp-(o.up||2),
+        g:o.g===undefined?0.25:o.g, life:o.life||0.9, life0:o.life||0.9,
+        size:(o.size||6)*(0.6+Math.random()*0.8),
+        color:colors[i%colors.length], rot:Math.random()*Math.PI, vr:(Math.random()*2-1)*0.3,
+        confetti:!!o.confetti,
+      });
+    }
+    if(this.particles.length>400) this.particles.splice(0,this.particles.length-400);
+  },
+  confetti(x,y,n){ this.burst(x,y,n,['#ffd54f','#ef5350','#4fc3f7','#81c784','#ba68c8','#ffffff'],{confetti:true,life:1.4,speed:7,g:0.22}); },
+  sparks(x,y,n){ this.burst(x,y,n,['#ffb300','#ff7043','#ffe082','#ffffff'],{speed:9,life:0.55,size:5,g:0.15}); },
+  shakeIt(mag,dur){ this.shakeMag=mag; this.shakeUntil=Date.now()+dur; },
+  flashIt(color,dur){ this.flashColor=color; this.flashUntil=Date.now()+dur; this.flashDur=dur; },
+  update(){
+    const now=Date.now();
+    if(now>this.shakeUntil){ this.offX=0; this.offY=0; }
+    else { const k=Math.min(1,(this.shakeUntil-now)/400); this.offX=(Math.random()*2-1)*this.shakeMag*k; this.offY=(Math.random()*2-1)*this.shakeMag*k; }
+    for(let i=this.particles.length-1;i>=0;i--){
+      const p=this.particles[i];
+      p.life-=1/60;
+      if(p.life<=0||p.y>H+40){ this.particles.splice(i,1); continue; }
+      p.vy+=p.g; p.x+=p.vx; p.y+=p.vy; p.vx*=0.99; p.rot+=p.vr;
+    }
+  },
+  render(){
+    for(const p of this.particles){
+      const a=Math.max(0,Math.min(1,p.life/p.life0));
+      ctx.save(); ctx.globalAlpha=a; ctx.translate(p.x,p.y); ctx.rotate(p.rot);
+      ctx.fillStyle=p.color;
+      if(p.confetti) ctx.fillRect(-p.size/2,-p.size/4,p.size,p.size/2);
+      else { ctx.beginPath(); ctx.arc(0,0,p.size*a,0,Math.PI*2); ctx.fill(); }
+      ctx.restore();
+    }
+    if(this.flashColor && Date.now()<this.flashUntil){
+      ctx.save();
+      ctx.globalAlpha=0.45*((this.flashUntil-Date.now())/this.flashDur);
+      ctx.fillStyle=this.flashColor; ctx.fillRect(0,0,W,H);
+      ctx.restore();
+    }
+  },
+};
+
+// 某家出牌区坐标（与 renderGame 布局一致，供特效定位）
+function playAreaPos(seat){
+  const s=ui.snap;
+  if(!s||seat==null) return {x:W/2,y:H/2};
+  if(seat===ui.mySeat) return {x:W/2,y:250};
+  const rel=(seat-ui.mySeat+4)%4;
+  if(rel===1) return {x:W-300,y:300};
+  if(rel===2) return {x:W/2,y:130};
+  return {x:300,y:300};
+}
+
 function toast(t, ms=2400){ ui.toast = {t, until: Date.now()+ms}; }
 function banner(t, ms=2600){ ui.banner = {t, until: Date.now()+ms}; }
 function label(c){ if(c.suit==='X') return c.rank==='BJ'?'大王':'小王'; return c.suit+({T:'10'}[c.rank]||c.rank); }
@@ -84,6 +190,7 @@ function shadow(on){ if(on){ ctx.shadowColor='rgba(0,0,0,.35)'; ctx.shadowBlur=1
 
 function btn(text,x,y,w,h,fn,o={}){
   const hover = mouse.x>=x&&mouse.x<=x+w&&mouse.y>=y&&mouse.y<=y+h;
+  const action = ()=>{ audio.init(); audio.click(); fn(); };
   const c1 = o.color||'#2e9e5b', c2 = o.color2||'#1f7a43';
   const g = ctx.createLinearGradient(x,y,x,y+h);
   g.addColorStop(0, hover?lighten(c1,.12):c1); g.addColorStop(1, hover?lighten(c2,.12):c2);
@@ -96,7 +203,7 @@ function btn(text,x,y,w,h,fn,o={}){
   if(o.icon){ ctx.fillText(o.icon, x+w/2, y+h*0.32); ctx.font=(o.size*0.72)+'px sans-serif'; ctx.fillText(text, x+w/2, y+h*0.70); }
   else ctx.fillText(text, x+w/2, y+h/2+1);
   ctx.textBaseline='alphabetic';
-  ui.buttons.push({x,y,w,h,fn});
+  ui.buttons.push({x,y,w,h,fn:action});
 }
 function lighten(hex, amt){
   const n = parseInt(hex.slice(1),16);
@@ -204,14 +311,17 @@ function playerPanel(x,y,seat,o={}){
   ctx.textAlign='left';
 }
 
-// 倒计时（画在指定位置，参考截图的大数字倒计时）
-function drawCountdown(x,y){
+// 倒计时（画在指定位置；mine=自己回合，最后5秒有滴答声）
+function drawCountdown(x,y,mine){
   const s = ui.snap; if(!s || !s.turnDeadline) return;
   const remain = Math.max(0, Math.ceil((s.turnDeadline-Date.now())/1000));
   ctx.fillStyle='rgba(0,0,0,.55)'; rr(x-30,y-24,60,48,12); ctx.fill();
   ctx.fillStyle = remain<=10?'#ef5350':'#ffc93c';
   ctx.font='bold 30px sans-serif'; ctx.textAlign='center';
   ctx.fillText(remain, x, y+10);
+  if(mine && remain<=5 && remain>0){
+    if(fx.lastTickSec!==remain){ fx.lastTickSec=remain; audio.tick(); }
+  }
 }
 
 // 某家最近出的牌（或"不出"），画在 (x, y)
@@ -234,9 +344,14 @@ function drawPlayArea(seat, x, y){
 // —— 场景 ——
 function render(){
   try{
+    fx.update();
     ctx.clearRect(0,0,W,H); ui.buttons=[];
+    ctx.save();
+    if(ui.scene==='game') ctx.translate(fx.offX,fx.offY); // 震屏偏移
     ({login:renderLogin, lobby:renderLobby, room:renderRoom, game:renderGame, result:renderResult}[ui.scene]||renderLogin)();
+    ctx.restore();
     if(ui.scene==='game'){ renderEndDialog(); renderVoteDialog(); }
+    if(ui.scene==='game'||ui.scene==='result') fx.render(); // 粒子特效（对局/结算页）
     drawBanner(); drawToast();
   }catch(e){ console.error('render error:', e); } // 单帧异常不能中断渲染循环
   requestAnimationFrame(render);
@@ -317,10 +432,15 @@ function renderLobby(){
   ctx.fillStyle='#fff'; ctx.font='bold 26px sans-serif'; ctx.textAlign='left';
   ctx.fillText('👤 '+(p.name||''), 30, 42);
   ctx.fillStyle='#ffd54f'; ctx.textAlign='right'; ctx.font='bold 26px sans-serif';
-  ctx.fillText('🪙 '+(p.coins??0), W-30, 42);
+  ctx.fillText('🪙 '+(p.coins??0), W-110, 42);
   ctx.fillStyle='rgba(255,255,255,.5)'; ctx.font='20px sans-serif'; ctx.textAlign='center';
   const st=p.stats||{};
   ctx.fillText(`战绩 ${st.wins||0}胜 / ${st.matches||0}场 / ${st.rounds||0}副`, W/2, 42);
+  // 静音开关
+  btn(audio.enabled?'🔊':'🔇', W-90, 10, 48, 44, ()=>{
+    audio.enabled=!audio.enabled;
+    localStorage.setItem('gd_mute', audio.enabled?'0':'1');
+  }, {color:audio.enabled?'#2e9e5b':'#616161',color2:audio.enabled?'#1f7a43':'#424242',size:22,radius:22});
   // 三个入口
   const items = [
     {icon:'🤖', title:'人机练习', desc:'和3个机器人打一桌', color:'#7e57c2', color2:'#5e35b1', fn: async ()=>{
@@ -415,7 +535,7 @@ function renderGame(){
 
   // 我的出牌区（中央偏上）
   drawPlayArea(ui.mySeat, W/2, 250);
-  if(s.turn===ui.mySeat) drawCountdown(W/2, 210);
+  if(s.turn===ui.mySeat) drawCountdown(W/2, 210, true);
 
   // —— 手牌区 ——
   if(ui.sortMode==='grid') renderHandGrid(s);     // 矩阵摆牌（默认：点数横排、同点数竖叠、同花色尽量同行）
@@ -705,9 +825,10 @@ api.on('welcome', d=>{ api.profile=d.profile; ui.myId=d.profile.id; });
 api.on('room_state', d=>{ ui.roomState=d; });
 api.on('queued', d=>toast(`排队中，第${d.position}位（共${d.waiting}人）`));
 api.on('game_start', d=>{
+  audio.init();
   ui.mySeat = d.snapshot.mySeat ?? d.seat; ui.snap=d.snapshot; ui.teamIdx=d.snapshot.teamOf[ui.mySeat];
   ui.scene='game'; ui.selected.clear(); ui.hintOpts=[]; setTimer(d.snapshot);
-  if(!d.reconnect) banner(`亮 ${d.snapshot.flip} → 打${d.snapshot.level} 拖${d.snapshot.tug}`, 3200);
+  if(!d.reconnect){ banner(`亮 ${d.snapshot.flip} → 打${d.snapshot.level} 拖${d.snapshot.tug}`, 3200); audio.deal(); }
 });
 api.on('snapshot', d=>{ ui.snap=d.snapshot; setTimer(d.snapshot); });
 api.on('end_proposal', d=>{
@@ -716,16 +837,26 @@ api.on('end_proposal', d=>{
 });
 api.on('events', d=>{
   for(const ev of d.events){
+    if(ev.type==='play'){
+      const p = playAreaPos(ev.seat);
+      if(ev.shape==='kings'){ audio.kings(); fx.shakeIt(14,600); fx.flashIt('#ffffff',300); fx.sparks(p.x,p.y,40); }
+      else if(ev.shape==='bomb'){ audio.bomb(); fx.shakeIt(10,450); fx.flashIt('#ff7043',220); fx.sparks(p.x,p.y,26); }
+      else if(ev.shape==='straight_flush'){ audio.playCard(); fx.sparks(p.x,p.y,14); }
+      else audio.playCard();
+    }
+    if(ev.type==='pass') audio.pass();
     if(ev.type==='match_over') handleMatchOver(ev);
-    if(ev.type==='finish' && ui.snap) banner(`${ui.snap.names[ev.seat]} ${['🏆头游','🥈二游','三游','末游'][ev.rank-1]}`, 2000);
-    if(ev.type==='tug_locked') banner('🔒 头游纯拖牌！不可压制，接风队友', 2600);
+    if(ev.type==='finish' && ui.snap){ banner(`${ui.snap.names[ev.seat]} ${['🏆头游','🥈二游','三游','末游'][ev.rank-1]}`, 2000); audio.finish(); }
+    if(ev.type==='tug_locked'){ banner('🔒 头游纯拖牌！不可压制，接风队友', 2600); fx.flashIt('#ffd54f',400); audio.turn(); }
     if(ev.type==='auto_play') toast('超时，系统已代出',1400);
     if(ev.type==='round_result'){
       const r=ev.result, win=r.winners.includes(ui.mySeat), stake=ui.roomState?ui.roomState.stake:1;
       banner(`${win?'本副获胜 🎉':'本副失利'}  ${r.base}+${r.tugBonus}+${r.leftover}=${r.total}级${r.capped?'(封顶)':''} ${win?'+':'−'}${r.total*stake}币`, 3600);
+      if(win){ audio.win(); fx.confetti(W/2, H*0.35, 60); fx.flashIt('#ffd54f',300); }
+      else audio.lose();
       ui.selected.clear(); ui.hintOpts=[];
     }
-    if(ev.type==='next_round') banner(`第${ev.roundNum}副：亮牌定级 打${ev.level}`, 2400);
+    if(ev.type==='next_round'){ banner(`第${ev.roundNum}副：亮牌定级 打${ev.level}`, 2400); audio.deal(); }
   }
 });
 function handleMatchOver(ev){
@@ -733,11 +864,26 @@ function handleMatchOver(ev){
   ui.terminatedReason = ev.terminated ? (ev.reason||'提前结束') : null;
   ui.endDialog = null;
   ui.scene='result';
+  const won = ui.finalRanking.length && String(ui.finalRanking[0].id)===String(ui.myId);
+  if(won){
+    audio.fanfare();
+    fx.confetti(W/2, H*0.3, 90);
+    setTimeout(()=>fx.confetti(W*0.25, H*0.4, 50), 350);
+    setTimeout(()=>fx.confetti(W*0.75, H*0.4, 50), 700);
+  } else audio.lose();
   refresh();
 }
 api.on('match_over', handleMatchOver); // 提前结束时为独立消息
 api.on('error', d=>{ toast(d.error); ui.selected.clear(); ui.hintOpts=[]; });
-function setTimer(s){ ui.deadline = (s && s.turn===ui.mySeat) ? (s.turnDeadline||ui.deadline||Date.now()+TURN_MS) : null; }
+function setTimer(s){
+  const mine = s && s.turn===s.mySeat;
+  if(mine && ui._lastTurnMine!==true){
+    audio.turn(); fx.lastTickSec=null;       // 轮到自己：提醒音
+    fx.sparks(W/2, H*0.78, 8);
+  }
+  ui._lastTurnMine = mine;
+  ui.deadline = mine ? (s.turnDeadline||Date.now()+TURN_MS) : null;
+}
 async function refresh(){
   const name = localStorage.getItem('gd_name'); if(!name) return;
   try{ const r = await api.post('/api/login',{name,password:'guest'}); if(r.ok){ api.profile=r.profile; api.token=r.token; } }catch{}
