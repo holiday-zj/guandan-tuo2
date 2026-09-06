@@ -116,13 +116,58 @@ const audio = {
   tick(){ this.tone(1000,0.05,{type:'square',vol:0.09}); },
 };
 
-// —— 视觉特效：粒子/震屏/闪光 ——
+// —— 人声播报（浏览器语音合成，无需音频文件）——
+const voice = {
+  enabled: localStorage.getItem('gd_voice')!=='0',
+  zh:null, ready:false,
+  init(){
+    if(!('speechSynthesis' in window)) return;
+    const pick=()=>{
+      const vs=speechSynthesis.getVoices()||[];
+      // 优先中文女声/标准普通话
+      this.zh = vs.find(v=>/zh[-_]CN/i.test(v.lang)) ||
+                vs.find(v=>/zh|Chinese|中文|普通话/i.test(v.lang+' '+v.name)) || null;
+      this.ready=true;
+    };
+    pick();
+    if(!this.ready) speechSynthesis.onvoiceschanged=pick;
+  },
+  say(text,{rate=1.1,pitch=1.0,vol=1.0}={}){
+    if(!this.enabled||!('speechSynthesis' in window)||!text) return;
+    try{
+      const u=new SpeechSynthesisUtterance(text);
+      u.lang='zh-CN';
+      if(this.zh) u.voice=this.zh;
+      u.rate=rate; u.pitch=pitch; u.volume=vol;
+      speechSynthesis.cancel();  // 打断上一句，避免堆积
+      speechSynthesis.speak(u);
+    }catch(e){}
+  },
+  // 牌型喊话表
+  lines:{
+    bomb:'炸弹！', kings:'天王炸！', straight_flush:'同花顺！',
+    straight:'顺子', pair_straight:'三连对', triple_straight:'钢板',
+    triple_pair:'三带二', triple:'三张',
+  },
+  announceShape(shape,byMe){
+    const t=this.lines[shape];
+    if(!t) return;
+    this.say(t, {rate: shape==='bomb'||shape==='kings'||shape==='straight_flush'?1.05:1.2,
+                 pitch: byMe?1.0:0.95, vol:1.0});
+  },
+};
+
+// —— 视觉特效：粒子/震屏/闪光/冲击波/大字动画/闪电/漂浮文字 ——
 const fx = {
-  particles:[], shakeMag:0, shakeUntil:0, offX:0, offY:0,
+  particles:[], shockwaves:[], bigTexts:[], lightnings:[], floats:[],
+  shakeMag:0, shakeUntil:0, offX:0, offY:0,
   flashColor:null, flashUntil:0, flashDur:300, lastTickSec:null,
+  confettiRainUntil:0,
+
   burst(x,y,n,colors,o={}){
     for(let i=0;i<n;i++){
-      const a=Math.random()*Math.PI*2, sp=(o.speed||6)*(0.4+Math.random()*0.8);
+      const a=o.dir!==undefined ? o.dir+(Math.random()-0.5)*(o.spread||1.2) : Math.random()*Math.PI*2;
+      const sp=(o.speed||6)*(0.4+Math.random()*0.8);
       this.particles.push({
         x,y, vx:Math.cos(a)*sp, vy:Math.sin(a)*sp-(o.up||2),
         g:o.g===undefined?0.25:o.g, life:o.life||0.9, life0:o.life||0.9,
@@ -131,24 +176,106 @@ const fx = {
         confetti:!!o.confetti,
       });
     }
-    if(this.particles.length>400) this.particles.splice(0,this.particles.length-400);
+    if(this.particles.length>500) this.particles.splice(0,this.particles.length-500);
   },
-  confetti(x,y,n){ this.burst(x,y,n,['#ffd54f','#ef5350','#4fc3f7','#81c784','#ba68c8','#ffffff'],{confetti:true,life:1.4,speed:7,g:0.22}); },
+  confetti(x,y,n){ this.burst(x,y,n,['#ffd54f','#ef5350','#4fc3f7','#81c784','#ba68c8','#ffffff'],{confetti:true,life:1.5,speed:7,g:0.22}); },
   sparks(x,y,n){ this.burst(x,y,n,['#ffb300','#ff7043','#ffe082','#ffffff'],{speed:9,life:0.55,size:5,g:0.15}); },
-  shakeIt(mag,dur){ this.shakeMag=mag; this.shakeUntil=Date.now()+dur; },
+
+  // 冲击波环（炸弹/天王）
+  shockwave(x,y,{rMax=230,color='#ff7043',count=3,dur=0.6,width=8}={}){
+    for(let i=0;i<count;i++)
+      this.shockwaves.push({x,y,r0:20+i*22,rMax:rMax+i*40,life:dur+i*0.12,life0:dur+i*0.12,color,width});
+  },
+  // 大字动画（缩放弹入 + 抖动 + 淡出）
+  bigText(text,{x=W/2,y=H*0.42,size=88,color='#ffd54f',stroke='#7f2700',dur=1.3,shake=8}={}){
+    this.bigTexts.push({text,x,y,size,color,stroke,dur,dur0:dur,shake});
+  },
+  // 闪电折线（天王炸）
+  lightning(x1,y1,x2,y2,{life=0.4,color='#fff8e1',branches=2}={}){
+    const mk=(ax,ay,bx,by,depth)=>{
+      const pts=[{x:ax,y:ay}];
+      const seg=7;
+      for(let i=1;i<seg;i++){
+        const t=i/seg;
+        pts.push({x:ax+(bx-ax)*t+(Math.random()*2-1)*34, y:ay+(by-ay)*t+(Math.random()*2-1)*34});
+      }
+      pts.push({x:bx,y:by});
+      this.lightnings.push({pts,life,life0:life,color,width:depth?2:4});
+      if(depth<branches && Math.random()<0.7){
+        const p=pts[2+Math.floor(Math.random()*3)];
+        mk(p.x,p.y,p.x+(Math.random()*2-1)*180,p.y+(Math.random()*2-1)*180,depth+1);
+      }
+    };
+    mk(x1,y1,x2,y2,0);
+  },
+  // 漂浮文字（积分变化）
+  floatText(text,x,y,{color='#ffd54f',size=34,dur=1.2}={}){
+    this.floats.push({text,x,y,color,size,dur,dur0:dur});
+  },
+  // 彩带雨（整场胜利）
+  confettiRain(dur=2600){ this.confettiRainUntil=Date.now()+dur; },
+
+  shakeIt(mag,dur){ this.shakeMag=Math.max(this.shakeMag,mag); this.shakeUntil=Math.max(this.shakeUntil,Date.now()+dur); },
   flashIt(color,dur){ this.flashColor=color; this.flashUntil=Date.now()+dur; this.flashDur=dur; },
+
   update(){
     const now=Date.now();
-    if(now>this.shakeUntil){ this.offX=0; this.offY=0; }
+    if(now>this.shakeUntil){ this.offX=0; this.offY=0; this.shakeMag=0; }
     else { const k=Math.min(1,(this.shakeUntil-now)/400); this.offX=(Math.random()*2-1)*this.shakeMag*k; this.offY=(Math.random()*2-1)*this.shakeMag*k; }
+    const dt=1/60;
     for(let i=this.particles.length-1;i>=0;i--){
       const p=this.particles[i];
-      p.life-=1/60;
+      p.life-=dt;
       if(p.life<=0||p.y>H+40){ this.particles.splice(i,1); continue; }
       p.vy+=p.g; p.x+=p.vx; p.y+=p.vy; p.vx*=0.99; p.rot+=p.vr;
     }
+    for(let i=this.shockwaves.length-1;i>=0;i--){
+      const s=this.shockwaves[i];
+      s.life-=dt;
+      if(s.life<=0){ this.shockwaves.splice(i,1); continue; }
+      const t=1-s.life/s.life0;
+      s.r=s.r0+(s.rMax-s.r0)*(1-Math.pow(1-t,2.4)); // ease-out
+    }
+    for(let i=this.bigTexts.length-1;i>=0;i--){
+      const b=this.bigTexts[i];
+      b.dur-=dt;
+      if(b.dur<=0) this.bigTexts.splice(i,1);
+    }
+    for(let i=this.lightnings.length-1;i>=0;i--){
+      const l=this.lightnings[i];
+      l.life-=dt;
+      if(l.life<=0) this.lightnings.splice(i,1);
+    }
+    for(let i=this.floats.length-1;i>=0;i--){
+      const f=this.floats[i];
+      f.dur-=dt; f.y-=0.9;
+      if(f.dur<=0) this.floats.splice(i,1);
+    }
+    if(now<this.confettiRainUntil && Math.random()<0.85){
+      this.burst(Math.random()*W, -20, 3,
+        ['#ffd54f','#ef5350','#4fc3f7','#81c784','#ba68c8','#ffffff'],
+        {confetti:true,life:2.4,speed:2.4,g:0.14,up:-1.2,size:8});
+    }
   },
   render(){
+    // 冲击波
+    for(const s of this.shockwaves){
+      const a=Math.max(0,s.life/s.life0);
+      ctx.save(); ctx.globalAlpha=a*0.85; ctx.strokeStyle=s.color;
+      ctx.lineWidth=s.width*a; ctx.beginPath(); ctx.arc(s.x,s.y,s.r,0,Math.PI*2); ctx.stroke();
+      ctx.restore();
+    }
+    // 闪电
+    for(const l of this.lightnings){
+      const a=Math.max(0,l.life/l.life0);
+      ctx.save(); ctx.globalAlpha=a;
+      ctx.shadowColor=l.color; ctx.shadowBlur=18;
+      ctx.strokeStyle=l.color; ctx.lineWidth=l.width; ctx.lineJoin='round';
+      ctx.beginPath(); ctx.moveTo(l.pts[0].x,l.pts[0].y);
+      for(const p of l.pts) ctx.lineTo(p.x,p.y);
+      ctx.stroke(); ctx.restore();
+    }
+    // 粒子
     for(const p of this.particles){
       const a=Math.max(0,Math.min(1,p.life/p.life0));
       ctx.save(); ctx.globalAlpha=a; ctx.translate(p.x,p.y); ctx.rotate(p.rot);
@@ -157,6 +284,41 @@ const fx = {
       else { ctx.beginPath(); ctx.arc(0,0,p.size*a,0,Math.PI*2); ctx.fill(); }
       ctx.restore();
     }
+    // 大字动画
+    for(const b of this.bigTexts){
+      const t=1-b.dur/b.dur0;            // 0→1
+      let scale, alpha;
+      if(t<0.18){ scale=0.4+ (t/0.18)*0.95; alpha=1; }        // 弹入放大到 1.35
+      else if(t<0.34){ scale=1.35-((t-0.18)/0.16)*0.35; alpha=1; } // 回落到 1.0
+      else if(t<0.78){ scale=1.0+Math.sin((t-0.34)*18)*0.025; alpha=1; } // 微抖
+      else { scale=1.0+((t-0.78)/0.22)*0.25; alpha=1-((t-0.78)/0.22); }   // 放大淡出
+      const jx=(Math.random()*2-1)*b.shake*(t<0.4?1:0.3);
+      const jy=(Math.random()*2-1)*b.shake*(t<0.4?1:0.3);
+      ctx.save();
+      ctx.globalAlpha=Math.max(0,alpha);
+      ctx.translate(b.x+jx,b.y+jy);
+      ctx.scale(scale,scale);
+      ctx.rotate((Math.random()*2-1)*0.012);
+      ctx.font='bold '+b.size+'px "PingFang SC","Microsoft YaHei",sans-serif';
+      ctx.textAlign='center'; ctx.textBaseline='middle';
+      ctx.lineJoin='round';
+      ctx.shadowColor='rgba(0,0,0,.6)'; ctx.shadowBlur=16; ctx.shadowOffsetY=5;
+      ctx.lineWidth=b.size*0.14; ctx.strokeStyle=b.stroke; ctx.strokeText(b.text,0,0);
+      const g=ctx.createLinearGradient(0,-b.size/2,0,b.size/2);
+      g.addColorStop(0,'#fff8e1'); g.addColorStop(0.45,b.color); g.addColorStop(1,'#ff8f00');
+      ctx.fillStyle=g; ctx.fillText(b.text,0,0);
+      ctx.restore();
+    }
+    // 漂浮文字
+    for(const f of this.floats){
+      const a=Math.max(0,Math.min(1,f.dur/f.dur0));
+      ctx.save(); ctx.globalAlpha=a;
+      ctx.font='bold '+f.size+'px sans-serif'; ctx.textAlign='center';
+      ctx.lineWidth=5; ctx.strokeStyle='rgba(0,0,0,.55)'; ctx.strokeText(f.text,f.x,f.y);
+      ctx.fillStyle=f.color; ctx.fillText(f.text,f.x,f.y);
+      ctx.restore();
+    }
+    // 全屏闪光
     if(this.flashColor && Date.now()<this.flashUntil){
       ctx.save();
       ctx.globalAlpha=0.45*((this.flashUntil-Date.now())/this.flashDur);
@@ -165,6 +327,44 @@ const fx = {
     }
   },
 };
+
+// 牌型 → 特效强度（越大越炸）
+const SHAPE_FX = {
+  kings:5, bomb:4, straight_flush:3, triple_straight:2, pair_straight:2,
+  triple_pair:1, straight:1, triple:1, pair:0, single:0,
+};
+
+// 播放某家出牌的特效+人声
+function playFx(seat, shape, byMe){
+  const p = playAreaPos(seat);
+  const lv = SHAPE_FX[shape]||0;
+  if(shape==='kings'){
+    audio.kings(); voice.say('天王炸！',{rate:1.0,pitch:1.15});
+    fx.shakeIt(18,700); fx.flashIt('#ffffff',360);
+    fx.shockwave(p.x,p.y,{rMax:320,color:'#fff8e1',count:4,width:11});
+    fx.sparks(p.x,p.y,48);
+    fx.lightning(p.x-180,p.y-120,p.x+170,p.y+130,{branches:3,life:0.5});
+    fx.lightning(p.x+160,p.y-130,p.x-150,p.y+120,{branches:3,life:0.5});
+    fx.bigText('天王炸！',{size:96,color:'#fff176',stroke:'#b71c1c',dur:1.6,shake:12});
+  } else if(shape==='bomb'){
+    audio.bomb(); voice.say('炸弹！',{rate:1.0,pitch:1.1});
+    fx.shakeIt(13,560); fx.flashIt('#ff7043',260);
+    fx.shockwave(p.x,p.y,{rMax:250,color:'#ff8a65',count:3,width:9});
+    fx.sparks(p.x,p.y,30);
+    fx.bigText('炸弹！',{size:84,color:'#ffb74d',stroke:'#5d1a00',dur:1.3,shake:9});
+  } else if(shape==='straight_flush'){
+    audio.playCard(); voice.announceShape('straight_flush',byMe);
+    fx.shakeIt(6,300); fx.flashIt('#4fc3f7',200);
+    fx.shockwave(p.x,p.y,{rMax:170,color:'#4fc3f7',count:2,width:6});
+    fx.sparks(p.x,p.y,18);
+    fx.bigText('同花顺！',{size:70,color:'#81d4fa',stroke:'#01579b',dur:1.15,shake:5});
+  } else if(lv>=1){
+    audio.playCard(); voice.announceShape(shape,byMe);
+    fx.burst(p.x,p.y,8,['#ffe082','#ffffff'],{speed:4,life:0.4,size:4});
+  } else {
+    audio.playCard();
+  }
+}
 
 // 某家出牌区坐标（与 renderGame 布局一致，供特效定位）
 function playAreaPos(seat){
@@ -436,11 +636,16 @@ function renderLobby(){
   ctx.fillStyle='rgba(255,255,255,.5)'; ctx.font='20px sans-serif'; ctx.textAlign='center';
   const st=p.stats||{};
   ctx.fillText(`战绩 ${st.wins||0}胜 / ${st.matches||0}场 / ${st.rounds||0}副`, W/2, 42);
-  // 静音开关
+  // 静音开关 + 人声开关
   btn(audio.enabled?'🔊':'🔇', W-90, 10, 48, 44, ()=>{
     audio.enabled=!audio.enabled;
     localStorage.setItem('gd_mute', audio.enabled?'0':'1');
   }, {color:audio.enabled?'#2e9e5b':'#616161',color2:audio.enabled?'#1f7a43':'#424242',size:22,radius:22});
+  btn(voice.enabled?'🗣':'🤐', W-150, 10, 48, 44, ()=>{
+    voice.enabled=!voice.enabled;
+    localStorage.setItem('gd_voice', voice.enabled?'1':'0');
+    if(voice.enabled){ voice.init(); voice.say('人声已开启',{rate:1.1}); }
+  }, {color:voice.enabled?'#1565c0':'#616161',color2:voice.enabled?'#0d47a1':'#424242',size:22,radius:22});
   // 三个入口
   const items = [
     {icon:'🤖', title:'人机练习', desc:'和3个机器人打一桌', color:'#7e57c2', color2:'#5e35b1', fn: async ()=>{
@@ -825,10 +1030,16 @@ api.on('welcome', d=>{ api.profile=d.profile; ui.myId=d.profile.id; });
 api.on('room_state', d=>{ ui.roomState=d; });
 api.on('queued', d=>toast(`排队中，第${d.position}位（共${d.waiting}人）`));
 api.on('game_start', d=>{
-  audio.init();
+  audio.init(); voice.init();
   ui.mySeat = d.snapshot.mySeat ?? d.seat; ui.snap=d.snapshot; ui.teamIdx=d.snapshot.teamOf[ui.mySeat];
   ui.scene='game'; ui.selected.clear(); ui.hintOpts=[]; setTimer(d.snapshot);
-  if(!d.reconnect){ banner(`亮 ${d.snapshot.flip} → 打${d.snapshot.level} 拖${d.snapshot.tug}`, 3200); audio.deal(); }
+  if(!d.reconnect){
+    banner(`亮 ${d.snapshot.flip} → 打${d.snapshot.level} 拖${d.snapshot.tug}`, 3200);
+    audio.deal();
+    voice.say('开局，打'+d.snapshot.level,{rate:1.05,pitch:1.05});
+    fx.bigText('打 '+d.snapshot.level,{size:76,color:'#ffe082',dur:1.5,shake:5});
+    fx.sparks(W/2,H*0.5,16);
+  }
 });
 api.on('snapshot', d=>{ ui.snap=d.snapshot; setTimer(d.snapshot); });
 api.on('end_proposal', d=>{
@@ -838,25 +1049,49 @@ api.on('end_proposal', d=>{
 api.on('events', d=>{
   for(const ev of d.events){
     if(ev.type==='play'){
-      const p = playAreaPos(ev.seat);
-      if(ev.shape==='kings'){ audio.kings(); fx.shakeIt(14,600); fx.flashIt('#ffffff',300); fx.sparks(p.x,p.y,40); }
-      else if(ev.shape==='bomb'){ audio.bomb(); fx.shakeIt(10,450); fx.flashIt('#ff7043',220); fx.sparks(p.x,p.y,26); }
-      else if(ev.shape==='straight_flush'){ audio.playCard(); fx.sparks(p.x,p.y,14); }
-      else audio.playCard();
+      playFx(ev.seat, ev.shape, ev.seat===ui.mySeat);
     }
-    if(ev.type==='pass') audio.pass();
+    if(ev.type==='pass'){
+      audio.pass();
+      if(ev.seat!==ui.mySeat) voice.say('不出',{rate:1.25,pitch:0.95,vol:0.8});
+    }
     if(ev.type==='match_over') handleMatchOver(ev);
-    if(ev.type==='finish' && ui.snap){ banner(`${ui.snap.names[ev.seat]} ${['🏆头游','🥈二游','三游','末游'][ev.rank-1]}`, 2000); audio.finish(); }
-    if(ev.type==='tug_locked'){ banner('🔒 头游纯拖牌！不可压制，接风队友', 2600); fx.flashIt('#ffd54f',400); audio.turn(); }
+    if(ev.type==='finish' && ui.snap){
+      banner(`${ui.snap.names[ev.seat]} ${['🏆头游','🥈二游','三游','末游'][ev.rank-1]}`, 2000);
+      audio.finish();
+      if(ev.rank<=2){
+        voice.say(ev.rank===1?'头游！':'二游！',{rate:1.05,pitch:1.1});
+        const p=playAreaPos(ev.seat);
+        fx.confetti(p.x,p.y,30);
+      }
+    }
+    if(ev.type==='tug_locked'){
+      banner('🔒 头游纯拖牌！不可压制，接风队友', 2600);
+      fx.flashIt('#ffd54f',400); fx.bigText('拖牌锁定！',{size:64,color:'#ffe082',dur:1.2});
+      voice.say('拖牌！接风！',{rate:1.0,pitch:1.1});
+      audio.turn();
+    }
     if(ev.type==='auto_play') toast('超时，系统已代出',1400);
     if(ev.type==='round_result'){
       const r=ev.result, win=r.winners.includes(ui.mySeat), stake=ui.roomState?ui.roomState.stake:1;
       banner(`${win?'本副获胜 🎉':'本副失利'}  ${r.base}+${r.tugBonus}+${r.leftover}=${r.total}级${r.capped?'(封顶)':''} ${win?'+':'−'}${r.total*stake}币`, 3600);
-      if(win){ audio.win(); fx.confetti(W/2, H*0.35, 60); fx.flashIt('#ffd54f',300); }
-      else audio.lose();
+      if(win){
+        audio.win(); voice.say('赢了！加'+r.total+'级',{rate:1.05,pitch:1.1});
+        fx.confetti(W/2, H*0.35, 70); fx.flashIt('#ffd54f',300);
+        fx.bigText('胜利！',{size:80,color:'#ffd54f',dur:1.4});
+        fx.floatText('+'+(r.total*stake)+' 币', W/2, H*0.55, {color:'#a5d6a7',size:38});
+      } else {
+        audio.lose(); voice.say('可惜了',{rate:1.0,pitch:0.85});
+        fx.bigText('失利',{size:64,color:'#90a4ae',stroke:'#263238',dur:1.1,shake:3});
+        fx.floatText('−'+(r.total*stake)+' 币', W/2, H*0.55, {color:'#ef9a9a',size:38});
+      }
       ui.selected.clear(); ui.hintOpts=[];
     }
-    if(ev.type==='next_round'){ banner(`第${ev.roundNum}副：亮牌定级 打${ev.level}`, 2400); audio.deal(); }
+    if(ev.type==='next_round'){
+      banner(`第${ev.roundNum}副：亮牌定级 打${ev.level}`, 2400);
+      audio.deal();
+      fx.bigText('第'+ev.roundNum+'副',{size:60,color:'#b0bec5',stroke:'#263238',dur:1.0,shake:2});
+    }
   }
 });
 function handleMatchOver(ev){
@@ -866,11 +1101,16 @@ function handleMatchOver(ev){
   ui.scene='result';
   const won = ui.finalRanking.length && String(ui.finalRanking[0].id)===String(ui.myId);
   if(won){
-    audio.fanfare();
-    fx.confetti(W/2, H*0.3, 90);
-    setTimeout(()=>fx.confetti(W*0.25, H*0.4, 50), 350);
-    setTimeout(()=>fx.confetti(W*0.75, H*0.4, 50), 700);
-  } else audio.lose();
+    audio.fanfare(); voice.say('恭喜你，第一名！',{rate:1.0,pitch:1.1});
+    fx.confettiRain(3200);
+    fx.bigText('🏆 第一名！',{size:92,color:'#ffd54f',stroke:'#7f2700',dur:2.2,shake:10});
+    fx.flashIt('#ffd54f',500);
+  } else {
+    audio.lose();
+    const myRank = ui.finalRanking.findIndex(r=>String(r.id)===String(ui.myId))+1;
+    if(myRank>0) voice.say('本局第'+myRank+'名',{rate:1.0,pitch:0.9});
+    fx.bigText('第'+(myRank||'-')+'名',{size:76,color:'#90a4ae',stroke:'#263238',dur:1.8,shake:4});
+  }
   refresh();
 }
 api.on('match_over', handleMatchOver); // 提前结束时为独立消息
