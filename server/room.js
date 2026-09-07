@@ -34,7 +34,15 @@ export class Room {
 
   playerCount() { return this.seats.filter(Boolean).length; }
   isFull() { return this.playerCount() === 4; }
-  names() { return this.seats.map(s => (s ? s : '（空位）')); }
+  // 座位显示名：真人显示昵称（需要 nameOf 解析器），机器人显示编号
+  names(nameOf = null) {
+    return this.seats.map(s => {
+      if (!s) return '（空位）';
+      if (String(s).startsWith('bot:')) return '机器人' + String(s).slice(4);
+      if (nameOf) { const n = nameOf(s); if (n) return n; }
+      return String(s);
+    });
+  }
 }
 
 // —— 大厅（自由组队快速匹配队列）——

@@ -440,7 +440,8 @@ function broadcast(roomId, msg) {
 function broadcastRoom(roomId) {
   const room = lobby.rooms.get(roomId);
   if (!room) return;
-  broadcast(roomId, { type: 'room_state', seats: room.names(), state: room.state, stake: room.stake });
+  const nameOf = id => { const m = loadMember(id); return m ? m.name : null; };
+  broadcast(roomId, { type: 'room_state', seats: room.names(nameOf), state: room.state, stake: room.stake });
 }
 
 server.listen(PORT, () => {
