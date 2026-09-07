@@ -726,7 +726,7 @@ function renderLobby(){
     localStorage.setItem('gd_voice', voice.enabled?'1':'0');
     if(voice.enabled){ voice.init(); voice.say('人声已开启',{rate:1.1}); }
   }, {color:voice.enabled?'#1565c0':'#616161',color2:voice.enabled?'#0d47a1':'#424242',size:22,radius:22});
-  // 三个入口
+  // 四个入口（2×2 布局）
   const items = [
     {icon:'🤖', title:'人机练习', desc:'和3个机器人打一桌', color:'#7e57c2', color2:'#5e35b1', fn: async ()=>{
       api.send({type:'create_room', stake:1, botFill:true});
@@ -736,30 +736,53 @@ function renderLobby(){
       api.send({type:'create_room', stake:1, botFill:false});
       try{ const d = await api.wait('room_created'); ui.roomId=d.roomId; ui.scene='room'; }catch{}
     }},
+    {icon:'🔑', title:'加入房间', desc:'输入房间号加入', color:'#ffa726', color2:'#f57c00', fn: async ()=>{
+      let rid = '';
+      try{ rid = (prompt('输入房间号（例如 r101）：') || '').trim(); }catch{ return; }
+      if(!rid) return;
+      if(!/^r\d+$/i.test(rid)) rid = 'r' + rid.replace(/[^0-9]/g,''); // 容错：只输数字也行
+      api.send({type:'join_room', roomId: rid});
+      try{
+        const d = await api.wait('room_joined', 4000);
+        ui.roomId = d.roomId; ui.scene='room';
+        toast('已加入房间 '+d.roomId);
+      }catch(e){ /* 失败原因由 error 事件提示 */ }
+    }},
     {icon:'⚡', title:'快速匹配', desc:'大厅自动凑一桌', color:'#66bb6a', color2:'#43a047', fn: ()=>{
       api.send({type:'quick_match'}); toast('已进入匹配队列…');
     }},
   ];
   items.forEach((it,i)=>{
-    const x = W/2 - 3*300/2 - 30 + i*330, y = 190, w=300, h=330;
+    const col=i%2, row=Math.floor(i/2);
+    const x = W/2 - 2*250/2 - 15 + col*265, y = 150 + row*245, w=250, h=225;
     const hover = mouse.x>=x&&mouse.x<=x+w&&mouse.y>=y&&mouse.y<=y+h;
     shadow(true);
     ctx.fillStyle='rgba(255,255,255,'+(hover?0.13:0.07)+')'; rr(x,y,w,h,24); ctx.fill(); shadow(false);
     ctx.strokeStyle='rgba(255,255,255,.18)'; ctx.lineWidth=1.5; rr(x,y,w,h,24); ctx.stroke();
-    ctx.font='76px sans-serif'; ctx.textAlign='center'; ctx.fillText(it.icon, x+w/2, y+120);
-    ctx.fillStyle='#fff'; ctx.font='bold 32px sans-serif'; ctx.fillText(it.title, x+w/2, y+185);
-    ctx.fillStyle='rgba(255,255,255,.55)'; ctx.font='20px sans-serif'; ctx.fillText(it.desc, x+w/2, y+222);
-    btn('进入', x+w/2-70, y+252, 140, 54, it.fn, {color:it.color,color2:it.color2,size:22,radius:27});
+    ctx.font='60px sans-serif'; ctx.textAlign='center'; ctx.fillText(it.icon, x+w/2, y+92);
+    ctx.fillStyle='#fff'; ctx.font='bold 28px sans-serif'; ctx.fillText(it.title, x+w/2, y+142);
+    ctx.fillStyle='rgba(255,255,255,.55)'; ctx.font='18px sans-serif'; ctx.fillText(it.desc, x+w/2, y+172);
+    btn('进入', x+w/2-60, y+182, 120, 44, it.fn, {color:it.color,color2:it.color2,size:18,radius:22});
   });
-  ctx.fillStyle='rgba(255,255,255,.35)'; ctx.font='20px sans-serif'; ctx.textAlign='center';
-  ctx.fillText('规则：亮几打几+1 · 打2拖3其余拖2 · 红拖算2级 · 每副独立结算', W/2, 610);
+  ctx.fillStyle='rgba(255,255,255,.35)'; ctx.font='18px sans-serif'; ctx.textAlign='center';
+  ctx.fillText('规则：亮几打几+1 · 打2拖3其余拖2 · 红拖算2级 · 每副独立结算', W/2, 665);
 }
 
 function renderRoom(){
   tableBg();
   ctx.fillStyle='rgba(0,0,0,.4)'; ctx.fillRect(0,0,W,64);
-  ctx.fillStyle='#fff'; ctx.font='bold 28px sans-serif'; ctx.textAlign='center';
-  ctx.fillText('房间 '+ui.roomId, W/2, 43);
+  ctx.fillStyle='#ffd54f'; ctx.font='bold 30px sans-serif'; ctx.textAlign='center';
+  ctx.fillText('房间号 '+ui.roomId, W/2-70, 44);
+  // 复制房间号按钮
+  btn('📋 复制房间号', W/2+130, 12, 170, 42, ()=>{
+    const text = ui.roomId;
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).then(()=>toast('房间号已复制：'+text)).catch(()=>toast('房间号：'+text+'（长按手动复制）'));
+    } else toast('房间号：'+text);
+  }, {color:'#37474f',color2:'#263238',size:17,radius:21});
+  // 底部引导：告诉房主怎么邀请朋友
+  ctx.fillStyle='rgba(255,255,255,.6)'; ctx.font='19px sans-serif'; ctx.textAlign='center';
+  ctx.fillText('朋友进入大厅 →「🔑 加入房间」→ 输入 '+ui.roomId+' 即可加入', W/2, H-120);
   const seats = ui.roomState?ui.roomState.seats:[null,null,null,null];
   const pos = [{x:W/2,y:H*0.66},{x:W*0.78,y:H*0.42},{x:W/2,y:H*0.26},{x:W*0.22,y:H*0.42}];
   for(let i=0;i<4;i++){
