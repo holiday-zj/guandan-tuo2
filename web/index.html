@@ -34,6 +34,7 @@ const AVATAR_BG = ['#5c6bc0','#26a69a','#ef5350','#ffa726'];
 // —— 网络 ——
 const api = {
   token:null, profile:null, ws:null, handlers:{}, waiters:[],
+  connected:false, heartbeat:null, lastPong:0, reconnectTimer:null, reconnecting:false, queue:[],
   async post(path, data){
     const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)});
     return r.json();
@@ -47,20 +48,99 @@ const api = {
   },
   dispatch(d){
     for(const w of this.waiters.slice()) if(w.t===d.type){ clearTimeout(w.timer); this.waiters=this.waiters.filter(x=>x!==w); w.res(d); }
-    (this.handlers[d.type]||[]).forEach(f=>f(d));
+    // 每个 handler 单独 try/catch：一个处理器出错不能吞掉整条消息
+    for(const f of (this.handlers[d.type]||[])){
+      try{ f(d); }catch(e){ console.error('handler error ['+d.type+']:', e); }
+    }
   },
   connect(){
-    return new Promise((res,rej)=>{
+    return new Promise((resolve,reject)=>{
       const proto = location.protocol==='https:'?'wss':'ws';
-      this.ws = new WebSocket(`${proto}://${location.host}/?token=${this.token}`);
-      this.ws.onopen = ()=>res();
-      this.ws.onerror = e=>rej(e);
-      this.ws.onclose = ()=>toast('连接已断开');
-      this.ws.onmessage = m=>{ try{ this.dispatch(JSON.parse(m.data)); }catch{} };
+      const ws = new WebSocket(`${proto}://${location.host}/?token=${this.token}`);
+      this.ws = ws;
+      ws.onopen = ()=>{
+        this.connected=true; this.lastPong=Date.now();
+        this.startHeartbeat();
+        const q=this.queue; this.queue=[];
+        q.forEach(o=>{ try{ ws.send(JSON.stringify(o)); }catch{} });
+        resolve();
+      };
+      ws.onerror = e=>{ if(!this.connected) reject(e); };
+      ws.onclose = ()=>{
+        this.connected=false;
+        this.stopHeartbeat();
+        this.scheduleReconnect();
+      };
+      ws.onmessage = m=>{
+        try{
+          const d = JSON.parse(m.data);
+          if(d.type==='pong') this.lastPong=Date.now();
+          this.dispatch(d);
+        }catch(e){ console.error('bad message:', e); }
+      };
     });
   },
-  send(o){ if(this.ws && this.ws.readyState===1) this.ws.send(JSON.stringify(o)); },
+  // 心跳：20秒一次，保活 NAT/防火墙；50秒无响应判定假死，主动断开触发重连
+  startHeartbeat(){
+    this.stopHeartbeat();
+    this.heartbeat = setInterval(()=>{
+      if(!this.connected) return;
+      if(Date.now()-this.lastPong > 50000){
+        console.warn('心跳超时，强制重连');
+        try{ this.ws.close(); }catch{}
+        return;
+      }
+      this.send({type:'ping'});
+    }, 20000);
+  },
+  stopHeartbeat(){ if(this.heartbeat){ clearInterval(this.heartbeat); this.heartbeat=null; } },
+  // 自动重连：指数退避，最多10次
+  scheduleReconnect(){
+    if(this.reconnecting || !this.token) return;
+    this.reconnecting = true;
+    let attempt = 0;
+    const tryIt = async ()=>{
+      attempt++;
+      toast(`连接断开，正在重连(${attempt})…`);
+      try{
+        await this.connect();
+        this.reconnecting = false;
+        toast('已重新连接');
+        // 若服务端没恢复牌局（比如对局已结束/房间已解散），2.5秒后回大厅
+        if(ui.scene==='game' || ui.scene==='room'){
+          ui._gotStateSinceReconnect = false;
+          setTimeout(()=>{
+            if(!ui._gotStateSinceReconnect){
+              ui.scene='lobby'; ui.snap=null; ui.roomId=null; ui.roomState=null;
+              refresh(); toast('对局已结束，返回大厅');
+            }
+          }, 2500);
+        }
+      }catch(e){
+        if(attempt<10) this.reconnectTimer=setTimeout(tryIt, Math.min(10000, 1000*attempt));
+        else { this.reconnecting=false; toast('重连失败，请刷新页面'); }
+      }
+    };
+    this.reconnectTimer = setTimeout(tryIt, 800);
+  },
+  send(o){
+    if(this.ws && this.ws.readyState===1){ this.ws.send(JSON.stringify(o)); return true; }
+    // 未连接：游戏动作进队列等重连后补发，并立即触发重连（不再静默丢弃！）
+    if(o.type!=='ping'){
+      this.queue.push(o);
+      if(this.queue.length>20) this.queue.shift();
+    }
+    if(!this.connected && !this.reconnecting) this.scheduleReconnect();
+    return false;
+  },
 };
+// 手机切后台回来：立即检查连接，假死则强制重连
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState==='visible' && api.token){
+    if(!api.connected){ api.scheduleReconnect(); }
+    else if(Date.now()-api.lastPong > 35000){ try{ api.ws.close(); }catch{} }
+  }
+});
 
 // —— 状态 ——
 const ui = { scene:'login', mySeat:null, myId:null, snap:null, roomId:null, roomState:null,
@@ -1027,7 +1107,7 @@ cv.addEventListener('touchend', e=>{ e.preventDefault(); onUp(e); });
 
 // —— 网络事件 ——
 api.on('welcome', d=>{ api.profile=d.profile; ui.myId=d.profile.id; });
-api.on('room_state', d=>{ ui.roomState=d; });
+api.on('room_state', d=>{ ui.roomState=d; ui._gotStateSinceReconnect=true; });
 api.on('queued', d=>toast(`排队中，第${d.position}位（共${d.waiting}人）`));
 api.on('game_start', d=>{
   audio.init(); voice.init();
@@ -1041,7 +1121,7 @@ api.on('game_start', d=>{
     fx.sparks(W/2,H*0.5,16);
   }
 });
-api.on('snapshot', d=>{ ui.snap=d.snapshot; setTimer(d.snapshot); });
+api.on('snapshot', d=>{ ui.snap=d.snapshot; ui._gotStateSinceReconnect=true; setTimer(d.snapshot); });
 api.on('end_proposal', d=>{
   ui.endDialog = d;
   if(d.votes>=2) ui.endDialog=null; // 已达成，等 match_over

@@ -133,7 +133,11 @@ function attachWs(socket, member) {
       if (m.opcode !== OP.TEXT) continue;
       let msg;
       try { msg = JSON.parse(m.payload.toString()); } catch { continue; }
-      handleMsg(member, msg);
+      try { handleMsg(member, msg); } catch (e) {
+        // 单条消息处理出错不能拖垮整个服务端进程
+        console.error('[handleMsg error]', e && e.stack || e);
+        try { ws.send({ type: 'error', error: '服务器内部错误: ' + (e && e.message || e) }); } catch {}
+      }
     }
   });
   socket.on('close', () => {
