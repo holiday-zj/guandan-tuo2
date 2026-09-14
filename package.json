@@ -4,9 +4,10 @@
   "description": "掼蛋（安徽拖2）在线游戏：规则引擎 + 服务端 + 微信小游戏客户端",
   "type": "module",
   "scripts": {
-    "test": "node --test test/classify.test.js test/settle.test.js",
+    "test": "node --test test/classify.test.js test/settle.test.js test/hint.test.js",
     "test:e2e": "node test/e2e.test.js",
     "test:integration": "node test/integration.test.js",
+    "test:pay": "node test/pay.test.js && node test/wx-login.test.js",
     "sim": "node sim/sim.js 100",
     "start": "node server/index.js"
   }

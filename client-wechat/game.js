@@ -60,6 +60,7 @@ function render() {
     case 'lobby': renderLobby(); break;
     case 'room': renderRoom(); break;
     case 'game': renderGame(); break;
+    case 'shop': renderShop(); break;
   }
   // toast
   if (ui.toast && Date.now() < ui.toast.until) {
@@ -103,20 +104,32 @@ function renderLogin() {
   ctx.fillStyle = 'rgba(255,255,255,0.6)';
   ctx.font = '26px sans-serif';
   ctx.fillText('安徽玩法 · 亮牌定队 · 拖2结算', W / 2, H * 0.28 + 50);
-  button('游客快速登录', W / 2 - 190, H * 0.52, 380, 92, () => doLogin());
+  button('微信一键登录', W / 2 - 190, H * 0.50, 380, 92, () => doWxLogin(), '#07c160');
   ctx.fillStyle = 'rgba(255,255,255,0.45)';
   ctx.font = '22px sans-serif';
-  ctx.fillText('首次进入自动创建账号', W / 2, H * 0.52 + 130);
+  ctx.textAlign = 'center';
+  ctx.fillText('首次进入自动创建账号 · 无需密码', W / 2, H * 0.50 + 125);
+  ctx.fillText('健康游戏忠告：抵制不良游戏，拒绝盗版游戏。注意自我保护，谨防受骗上当。', W / 2, H - 70);
+  ctx.fillText('适度游戏益脑，沉迷游戏伤身，合理安排时间，享受健康生活。', W / 2, H - 40);
 }
 
-async function doLogin() {
-  const name = wx.getStorageSync('gd_name') || '玩家' + Math.floor(Math.random() * 100000);
+// 微信一键登录（wx.login → 服务端 code2session）；开发工具无微信环境时降级游客登录
+async function doWxLogin() {
   try {
+    await net.wxLogin();
+  } catch (e) {
+    // 开发环境兜底：游客账号
     try {
-      await net.login(name, 'guest');
-    } catch (e) {
-      await net.register(name, 'guest');
+      const name = wx.getStorageSync('gd_name') || '玩家' + Math.floor(Math.random() * 100000);
+      try { await net.login(name, 'guest'); }
+      catch (e2) { await net.register(name, 'guest'); }
+      wx.setStorageSync('gd_name', name);
+    } catch (e3) {
+      toast('登录失败: ' + (e3.message || e3.errMsg));
+      return;
     }
+  }
+  try {
     await net.connect();
     ui.scene = 'lobby';
   } catch (e) {
@@ -159,11 +172,99 @@ function renderLobby() {
       net.send({ type: 'start_game' });
     }).catch(() => toast('建房失败'));
   }, '#6a4c93');
+  button('💰 商城充值', W / 2 - 420, H * 0.58, 260, 90, () => openShop(), '#f57f17');
 
   ctx.fillStyle = 'rgba(255,255,255,0.5)';
   ctx.font = '24px sans-serif';
   ctx.textAlign = 'center';
   ctx.fillText('战绩：' + (p ? `${p.stats.wins}胜 / ${p.stats.matches}场` : '-'), W / 2, H * 0.72);
+}
+
+// —— 场景：商城 ——
+async function openShop() {
+  try {
+    ui.shop = await net.payPackages();
+    ui.scene = 'shop';
+  } catch (e) {
+    toast('商城加载失败: ' + e.message);
+  }
+}
+
+function renderShop() {
+  ctx.fillStyle = '#14432a';
+  ctx.fillRect(0, 0, W, H);
+  const p = net.profile || {};
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 40px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('游戏币商城', W / 2, 70);
+  ctx.fillStyle = '#ffd54f';
+  ctx.font = '28px sans-serif';
+  ctx.fillText('当前余额：' + (p.coins || 0) + ' 币', W / 2, 115);
+
+  const shop = ui.shop || {};
+  // 每日免费领取（合规兜底，始终可用）
+  button(shop.dailyClaimed ? '今日已领取' : `🎁 每日免费领 ${shop.dailyFree || 500} 币`,
+    W / 2 - 260, 145, 520, 76, async () => {
+      if (shop.dailyClaimed) return;
+      try {
+        const r = await net.claimDaily();
+        toast(`领取成功 +${r.coins} 币`);
+        ui.shop = await net.payPackages();
+      } catch (e) { toast(e.message); }
+    }, shop.dailyClaimed ? '#616161' : '#2e7d32');
+
+  // 充值开关状态说明（合规提示）
+  if (!shop.payEnabled) {
+    ctx.fillStyle = 'rgba(255,224,130,0.85)';
+    ctx.font = '22px sans-serif';
+    ctx.fillText('充值暂未开放（合规要求：游戏版号+虚拟支付资质审批中）', W / 2, 260);
+    ctx.fillText('每日免费金币可正常游戏，敬请期待充值开放', W / 2, 290);
+  }
+
+  // 档位卡片
+  const pkgs = shop.packages || [];
+  const cw = 280, chh = 150;
+  pkgs.slice(0, 6).forEach((pkg, i) => {
+    const col = i % 3, row = Math.floor(i / 3);
+    const x = W / 2 - 3 * (cw + 24) / 2 + col * (cw + 24) + 12;
+    const y = 320 + row * (chh + 24);
+    ctx.fillStyle = 'rgba(255,255,255,0.08)';
+    roundRect(x, y, cw, chh, 16); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+    roundRect(x, y, cw, chh, 16); ctx.stroke();
+    ctx.fillStyle = '#ffd54f';
+    ctx.font = 'bold 30px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(pkg.coins + ' 币', x + cw / 2, y + 50);
+    ctx.fillStyle = '#fff';
+    ctx.font = '26px sans-serif';
+    ctx.fillText('¥' + (pkg.amountFen / 100), x + cw / 2, y + 90);
+    button('购买', x + cw / 2 - 60, y + chh - 52, 120, 42, () => buyPackage(pkg.id),
+      shop.payEnabled ? '#f57f17' : '#757575');
+  });
+
+  button('← 返回大厅', W / 2 - 140, H - 90, 280, 70, () => { ui.scene = 'lobby'; net.refreshProfile(); }, '#37474f');
+}
+
+async function buyPackage(packageId) {
+  const shop = ui.shop || {};
+  if (!shop.payEnabled) {
+    toast('充值暂未开放，请领取每日免费金币');
+    return;
+  }
+  if (!shop.isVerified) {
+    // 未实名：引导实名认证（生产环境应弹微信实名组件）
+    toast('充值前需完成实名认证');
+    return;
+  }
+  const r = await net.createRecharge(packageId);
+  if (r.ok && r.paid) {
+    toast('充值成功！');
+    ui.shop = await net.payPackages();
+  } else {
+    toast(r.error || '支付未完成');
+  }
 }
 
 // —— 场景：房间等待 ——

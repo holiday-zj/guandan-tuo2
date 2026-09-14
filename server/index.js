@@ -10,6 +10,10 @@ import { acceptKey, parseFrames, encodeFrame, OP } from './ws.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = path.join(__dirname, '..', 'web');
 import { store, loadMember, settleCoins, publicProfile, memberCache } from './db.js';
+import { config } from './config.js';
+import {
+  wxLogin, createRecharge, claimDailyFree, verifyIdentity, devFakePay, handlePayNotify,
+} from './pay.js';
 import { Lobby, GameSession } from './room.js';
 import { botDecide } from './bot.js';
 import { followOptions, leadOptions } from '../engine/hint.js';
@@ -59,10 +63,34 @@ const server = http.createServer((req, res) => {
   // REST API
   let body = '';
   req.on('data', c => (body += c));
-  req.on('end', () => {
+  req.on('end', async () => {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     try {
       const data = body ? JSON.parse(body) : {};
+
+      // 微信登录（无需登录态）
+      if (url.pathname === '/api/wx/login') {
+        const r = await wxLogin(data.code || '');
+        if (!r.ok) { res.statusCode = 400; res.end(JSON.stringify(r)); return; }
+        res.end(JSON.stringify(r));
+        return;
+      }
+
+      // 米大师支付回调（生产需验签，验签逻辑在 handlePayNotify 中）
+      if (url.pathname === '/api/pay/notify') {
+        const r = handlePayNotify(data, req.headers['x-signature'] || '');
+        res.end(JSON.stringify({ ok: !!r.ok }));
+        return;
+      }
+
+      // 需要登录态的接口
+      if (url.pathname.startsWith('/api/pay/') || url.pathname === '/api/profile' || url.pathname === '/api/verify') {
+        const out = await handleAuthApi(url.pathname, req, data);
+        if (out.status) res.statusCode = out.status;
+        res.end(JSON.stringify(out.body));
+        return;
+      }
+
       const out = handleApi(url.pathname, req.method, data);
       res.end(JSON.stringify(out));
     } catch (e) {
@@ -90,10 +118,50 @@ function handleApi(path, method, data) {
     case '/api/rooms':
       return { ok: true, rooms: lobby.publicList(), queue: lobby.queue.length };
     case '/api/health':
-      return { ok: true, time: Date.now() };
+      return { ok: true, time: Date.now(), payEnabled: config.payEnabled };
     default:
       throw new Error('unknown path: ' + path);
   }
+}
+
+// 需要登录态的 API（token 从 Authorization 头或 query 取）
+function authMember(req) {
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : new URL(req.url, 'http://x').searchParams.get('token');
+  if (!token) return null;
+  return store.authByToken(token);
+}
+
+async function handleAuthApi(path, req, data) {
+  const member = authMember(req);
+  if (!member) return { status: 401, body: { ok: false, error: '未登录' } };
+  switch (path) {
+    case '/api/profile':
+      return { body: { ok: true, profile: publicProfile(store.memberById(member.id)) } };
+    case '/api/pay/packages':
+      return { body: { ok: true, packages: config.packages, payEnabled: config.payEnabled, dailyFree: config.dailyFreeCoins,
+        isVerified: member.isVerified, isMinor: member.isMinor,
+        dailyClaimed: store.dailyClaimed(member.id) } };
+    case '/api/pay/daily': {
+      const r = claimDailyFree(member);
+      return r.ok ? { body: r } : { status: 400, body: r };
+    }
+    case '/api/pay/create': {
+      const r = createRecharge(member, data.packageId, data.platform);
+      return r.ok ? { body: r } : { status: 400, body: r };
+    }
+    case '/api/pay/dev_fake': {
+      const r = devFakePay(member, data.packageId);
+      return r.ok ? { body: r } : { status: 400, body: r };
+    }
+    case '/api/pay/orders':
+      return { body: { ok: true, orders: store.listOrders(member.id) } };
+    case '/api/verify': {
+      const r = verifyIdentity(member, data.realName, data.idNumber);
+      return r.ok ? { body: r } : { status: 400, body: r };
+    }
+  }
+  throw new Error('unknown path: ' + path);
 }
 
 // —— WebSocket 会话 ——
