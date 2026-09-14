@@ -1,7 +1,12 @@
 // 网络层：微信登录 + REST（带鉴权头）+ WebSocket 对战（心跳/重连）
-// ⚠️ 上线前：BASE/WS 改为备案域名，且必须 HTTPS/WSS（微信强制）
-const BASE = 'http://127.0.0.1:8080';
-const WS = 'ws://127.0.0.1:8080';
+//
+// ⚠️ 上线前必须改这里：微信强制 HTTPS/WSS + 已备案域名，且域名要在
+//    微信公众平台「开发设置-服务器域名」白名单里配置（request 和 socket 两类）。
+//    当前是开发用的 HTTP+IP，只能在开发者工具勾选「不校验合法域名」时跑通。
+const SERVER_HOST = 'http://3.15.212.241:8080';   // TODO 上线改为 https://你的备案域名
+const WS_HOST = SERVER_HOST.replace(/^http/, 'ws'); // http→ws, https→wss
+const BASE = SERVER_HOST;
+const WS = WS_HOST;
 
 export const net = {
   token: null,
