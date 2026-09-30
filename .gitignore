@@ -1,6 +1,13 @@
 node_modules/
-data/server.log
-data/llm.env
-data/*.key
+
+# 运行时数据（含玩家密码哈希/身份证哈希/充值订单，绝不入库）
+data/
+!data/.gitkeep
+
+# 密钥与日志
 *.log
+*.key
+.env
+data/llm.env
+
 .DS_Store
