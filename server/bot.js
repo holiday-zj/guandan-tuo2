@@ -1,11 +1,41 @@
-// 服务端机器人：轮到 bot 座位时自动出牌（领出最小单张，能压则压）
+// 服务端机器人决策
+//   botDecide      —— 旧同步极简逻辑（保底，AI层异常时使用）
+//   botDecideAsync —— 主决策：LLM 出牌（大模型判断）+ 启发式保底，永不阻塞
 import { bestInterpretation, canBeat } from '../engine/classify.js';
+import { decideAsync } from '../engine/ai/decide.js';
+
+// 机器人思考时间下限（毫秒）：让节奏自然，也避免LLM未配置时刷屏
+const THINK_MIN_MS = Number(process.env.BOT_THINK_MIN || 400);
+// 单次 LLM 决策超时（毫秒），超时自动降级启发式
+const LLM_TIMEOUT_MS = Number(process.env.BOT_LLM_TIMEOUT || 9000);
 
 function valueOf(c, level) {
   return c.rank === 'BJ' ? 17 : c.rank === 'SJ' ? 16 : c.rank === level ? 15 : '23456789TJQKA'.indexOf(c.rank) + 2;
 }
 
-// 返回动作 {type:'play',cards:[{id}]} 或 {type:'pass'}
+// 主入口：异步决策（LLM 优先，失败降级）
+export async function botDecideAsync(session, seat) {
+  const t0 = Date.now();
+  let action;
+  try {
+    action = await decideAsync(session, seat, session.trackers || null, {
+      timeoutMs: LLM_TIMEOUT_MS,
+    });
+  } catch (e) {
+    action = botDecide(session, seat);
+    action.via = 'exception:' + (e.message || e);
+  }
+  // 节奏控制：至少 THINK_MIN_MS
+  const elapsed = Date.now() - t0;
+  if (elapsed < THINK_MIN_MS) await new Promise(r => setTimeout(r, THINK_MIN_MS - elapsed));
+  // 决策日志（便于观察AI质量；不含任何密钥）
+  if (process.env.BOT_DEBUG) {
+    console.log('[bot]', { seat, via: action.via, reason: action.reason, picked: action.picked, err: action.llmError });
+  }
+  return action;
+}
+
+// 旧同步极简逻辑（返回动作 {type:'play',cards:[{id}]} 或 {type:'pass'}）
 export function botDecide(session, seat) {
   const r = session.match.round;
   const d = session.driver;

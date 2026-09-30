@@ -2,6 +2,7 @@
 import net from 'node:net';
 import http from 'node:http';
 import crypto from 'node:crypto';
+import assert from 'node:assert/strict';
 import { interpret, bestInterpretation, canBeat } from '../engine/classify.js';
 
 function post(path, data) {
@@ -82,12 +83,20 @@ function valueOf(c, level) {
   return c.rank === 'BJ' ? 17 : c.rank === 'SJ' ? 16 : c.rank === level ? 15 : '23456789TJQKA'.indexOf(c.rank) + 2;
 }
 
-// 真人决策：领出最小单张；跟牌用引擎找最小能压的单张，否则过
+// 真人决策：领出最小单张（首攻避开纯拖）；跟牌用引擎找最小能压的单张，否则过
 function decide(snap, seat) {
   const level = snap.level;
   const hand = snap.hand;
   const sorted = hand.slice().sort((a, b) => valueOf(a, level) - valueOf(b, level));
-  if (!snap.best) return { type: 'play', cards: [{ id: sorted[0].id }] };
+  if (!snap.best) {
+    // 首攻禁拖：本副第一手(led=false)且拖牌=最小点时，跳过纯拖牌单张
+    const firstLead = snap.led === false;
+    for (const c of sorted) {
+      if (firstLead && c.rank === snap.tug) continue;
+      return { type: 'play', cards: [{ id: c.id }] };
+    }
+    return { type: 'play', cards: [{ id: sorted[0].id }] };
+  }
   // 跟牌：用引擎对 best 重建解释，再找最小能压的单张
   const target = bestInterpretation(snap.best.cards, level);
   for (const c of sorted) {
@@ -133,15 +142,27 @@ async function main() {
   };
 
   let iterations = 0;
+  const errCount = {};   // 真人动作被拒原因统计（>0 说明测试脚本决策有缺陷）
+  let lastErrCursor = 0;
+  let lastStallKey = null, stallSince = 0;
+  const t0 = Date.now();
   while (!matchOver && actions < 4000 && iterations < 60000) {
     iterations++;
     collect();
+    for (let i = lastErrCursor; i < c.inbox.length; i++) {
+      const m = c.inbox[i];
+      if (m.type === 'error') errCount[m.error] = (errCount[m.error] || 0) + 1;
+    }
+    lastErrCursor = c.inbox.length;
     if (matchOver) break;
     const snapMsg = c.latest(m => m.type === 'snapshot' || m.type === 'game_start');
     const snap = snapMsg.snapshot;
+    // 注意：每副牌亮牌后座位会重排（对角队友），必须用快照里的实时座位，
+    // 不能用开局时捕获的 gs.seat，否则第二副起永远等不到自己的回合而空转
+    const mySeat = snap.mySeat;
 
-    if (snap.turn === snap.mySeat) {
-      const act = decide(snap, snap.mySeat);
+    if (snap.turn === mySeat && snap.hand.length) {
+      const act = decide(snap, mySeat);
       c.send(act);
       actions++;
       // 等待服务端回推新快照（机器人已同步驱动完毕）
@@ -151,12 +172,30 @@ async function main() {
         if (c.inbox.length > before) break;
         await new Promise(r => setTimeout(r, 30));
       }
-      if (actions % 20 === 0) {
+      if (actions % 10 === 0) {
         collect();
         console.log(`  ... 已出 ${actions} 手, 已完成副数=${seenEvents.filter(e => e.type === 'round_result').length}, 手牌=${snap.hand.length}`);
       }
     } else {
       await new Promise(r => setTimeout(r, 50));
+      // 看门狗：超过8秒牌权都不在我手上且牌局无进展 → 打印诊断并退出
+      const snap2 = c.latest(m => m.type === 'snapshot' || m.type === 'game_start');
+      if (snap2 && snap2.snapshot && Date.now() - t0 > 8000 && actions > 0) {
+        const s = snap2.snapshot;
+        const stallKey = s.roundNum + ':' + s.turn + ':' + s.handCounts.join(',') + ':' + (s.best ? s.best.by : 'L');
+        if (stallKey === lastStallKey) {
+          stallSince = stallSince || Date.now();
+          if (Date.now() - stallSince > 8000) {
+            console.log('\n⚠ 牌局卡顿诊断:');
+            console.log('  roundNum=', s.roundNum, ' turn=', s.turn, ' mySeat=', s.mySeat);
+            console.log('  handCounts=', s.handCounts.join(','), ' finishOrder=', s.finishOrder);
+            console.log('  best=', s.best ? `seat${s.best.by} ${s.best.shape}` : 'null(领出)');
+            console.log('  turnDeadline=', s.turnDeadline, 'now=', Date.now(), '已过', Date.now() - s.turnDeadline, 'ms');
+            console.log('  真人出手数=', actions, ' 已完成副数=', seenEvents.filter(e => e.type === 'round_result').length);
+            assert.fail('牌局卡顿超过8秒: ' + JSON.stringify({ roundNum: s.roundNum, turn: s.turn, mySeat: s.mySeat, handCounts: s.handCounts }));
+          }
+        } else { lastStallKey = stallKey; stallSince = 0; }
+      }
     }
   }
   collect();
@@ -165,7 +204,22 @@ async function main() {
   const overEv = seenEvents.find(e => e.type === 'match_over');
   console.log('✓ 出手数:', actions);
   console.log('✓ 完成副数:', roundResults.length, '各副级数:', roundResults.map(r => r.result.total).join(','));
-  if (overEv) console.log('✓ 比赛结束, 胜方队伍', overEv.winnerTeam);
+  console.log('✓ 整场耗时:', ((Date.now() - t0) / 1000).toFixed(1) + 's');
+  if (overEv) {
+    const top = (overEv.ranking || [])[0];
+    console.log('✓ 比赛结束, 第一名:', top ? `${top.name}(${top.score}分)` : '-');
+    assert.ok(overEv.ranking && overEv.ranking.length === 4, 'match_over 应含4人积分排名');
+    assert.ok(typeof overEv.ranking[0].score === 'number', '排名应含积分');
+  }
+  // 真人动作不应被拒（被拒=测试脚本决策缺陷，会导致空转拖慢对局）
+  const errs = Object.entries(errCount);
+  if (errs.length) {
+    console.log('⚠ 真人动作被拒统计:', JSON.stringify(errCount));
+  } else {
+    console.log('✓ 真人动作无一被拒');
+  }
+  assert.equal(errs.length, 0, '真人动作被拒: ' + JSON.stringify(errCount));
+  assert.ok(roundResults.length >= 1, '至少完成1副');
 
   const login = await post('/api/login', { name, password: 'test123' });
   console.log('✓ 最终余额:', login.profile.coins, '(初始1000)');

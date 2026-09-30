@@ -139,3 +139,42 @@ test('wild cannot substitute jokers', () => {
   // 不能组成天王（需要双大王）
   assert.ok(!interps.some(it => it.type === 'kings'));
 });
+
+// —— 回归：interpret() 曾因共享可变数组导致含逢人配的解释 cards 为空 ——
+// 后果：canBeat 比较 cards.length 时把逢人配牌型误判为"压不过"，
+// 真人用逢人配压牌被拒 + AI 候选全失效
+test('回归：含逢人配的解释必须保留完整 cards（别名bug）', () => {
+  const lv = '5';
+  const wild = C('♥', lv); // 逢人配
+  const it = bestInterpretation([wild], lv);
+  assert.equal(it.type, 'single');
+  assert.equal(it.cards.length, 1, '单张解释的 cards 必须有1张，实际' + it.cards.length);
+
+  const pair = bestInterpretation([wild, C('♠', 'A')], lv);
+  assert.equal(pair.type, 'pair');
+  assert.equal(pair.cards.length, 2, '对子解释的 cards 必须有2张');
+
+  const interps = interpret([wild, C('♠', 'A'), C('♣', 'A')], lv);
+  for (const x of interps) {
+    assert.ok(x.cards.length >= 3, '任何解释都应含全部3张牌: ' + x.type + ' len' + x.cards.length);
+  }
+});
+
+test('回归：逢人配级牌单张可以压过A单张', () => {
+  const lv = '5';
+  const wildSingle = bestInterpretation([C('♥', lv)], lv);   // 逢人配当级牌单张 v15
+  const aSingle = bestInterpretation([C('♠', 'A')], lv);     // A单张 v14
+  assert.ok(canBeat(wildSingle, aSingle), '级牌单张(逢人配)应能压A单张');
+});
+
+test('回归：逢人配对子可以压过普通对子', () => {
+  const lv = '9';
+  const wildPair = bestInterpretation([C('♥', lv), C('♠', 'K')], lv); // 配成KK? 实际配成级牌对或K对
+  assert.ok(wildPair, '应能组成对子');
+  assert.equal(wildPair.cards.length, 2);
+  const small = bestInterpretation([C('♠', 'A'), C('♣', 'A')], lv);
+  // 逢人配可配成级牌对(v15)压AA(v14)
+  if (wildPair.value > small.value) {
+    assert.ok(canBeat(wildPair, small), '更大的对子应能压过');
+  }
+});

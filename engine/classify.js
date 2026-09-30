@@ -118,7 +118,10 @@ export function interpret(cards, level) {
 
   function walk(i, current) {
     if (i === wilds.length) {
-      for (const it of classifyNatural(current, level)) results.push(it);
+      // 必须传副本：current 会被后续 push/pop 复用，
+      // 若直接传引用，返回结果里的 cards 最终都会变成空数组，
+      // 导致 canBeat 比较 cards.length 时把逢人配牌型误判为"压不过"
+      for (const it of classifyNatural(current.slice(), level)) results.push(it);
       return;
     }
     for (const sub of ALL_SUB) {

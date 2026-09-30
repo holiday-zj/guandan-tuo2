@@ -495,8 +495,19 @@ net.on('events', d => {
       ui.hintOptions = [];
     }
     if (ev.type === 'match_over') {
-      const win = ui.teamIdx === ev.winnerTeam;
-      toast(win ? '🎉 你们赢了整场！' : '整场结束，对方获胜', 5000);
+      // 积分绑个人：按个人积分名次判断胜负（ranking 已按分数降序）
+      const ranking = ev.ranking || [];
+      const myId = net.profile ? String(net.profile.id) : null;
+      const myIdx = ranking.findIndex(r => String(r.id) === myId);
+      const win = myIdx === 0;
+      if (ranking.length) {
+        const top = ranking[0];
+        toast(win
+          ? `🎉 第一名！积分 ${top.score}`
+          : `整场结束：${top.name || '对手'} 第一(${top.score}分)，你第${myIdx + 1 || '-'}名`, 5000);
+      } else {
+        toast('整场结束', 5000);
+      }
       setTimeout(() => {
         ui.scene = 'lobby';
         ui.snapshot = null;

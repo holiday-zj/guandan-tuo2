@@ -1,8 +1,9 @@
 // 房间与大厅管理 + 单场对局编排（基于 engine）
 import crypto from 'node:crypto';
 import { Match } from '../engine/match.js';
-import { cardLabel } from '../engine/cards.js';
-import { botDecide } from './bot.js';
+import { cardLabel, orderValue } from '../engine/cards.js';
+import { PlayTracker } from '../engine/ai/analyze.js';
+import { botDecide, botDecideAsync } from './bot.js';
 
 let roomSeq = 100;
 
@@ -110,6 +111,7 @@ export class GameSession {
     this.lastPlays = {};   // seat -> {pass} 或 {cards:[...]} 当前圈内各家最近动作
     this.turnStartedAt = Date.now();
     this._finishNotified = new Set(); // 已发过 finish 事件的座位（含自动判定的名次）
+    this.trackers = null;             // 每座位一个 PlayTracker（AI算牌用，只记公开信息）
   }
 
   seatNames() {
@@ -149,9 +151,13 @@ export class GameSession {
       best: null,               // {cards, it, by}
       consecutivePasses: 0,
       turn: lead,
+      trickSeq: 0,              // 本圈是第几手（供AI判断局势）
     };
     this.lastPlays = {};
     this.turnStartedAt = Date.now();
+    // AI 算牌追踪器：每个座位一份，只记录公开信息（谁出了什么/过牌几次）
+    this.trackers = [new PlayTracker(), new PlayTracker(), new PlayTracker(), new PlayTracker()];
+    for (const t of this.trackers) t.reset(round.level, round.tug);
     this._finishNotified = new Set();
     return info;
   }
@@ -185,6 +191,7 @@ export class GameSession {
       if (!d.best) return { ok: false, error: '领出不能过' };
       d.consecutivePasses++;
       this.lastPlays[seat] = { pass: true };
+      if (this.trackers) for (const t of this.trackers) t.record(seat, null, 'pass');
       events.push({ type: 'pass', seat });
       const needPasses = this.activeCount() - (this.active(d.best.by) ? 1 : 0);
       if (d.consecutivePasses >= needPasses) {
@@ -206,7 +213,13 @@ export class GameSession {
 
     d.best = { cards, it: ev.play, by: seat };
     d.consecutivePasses = 0;
+    d.trickSeq = (d.trickSeq || 0) + 1;
     this.lastPlays[seat] = { pass: false, cards: cards.map(c => ({ id: c.id, suit: c.suit, rank: c.rank })) };
+    // 公开出牌记入所有座位的追踪器（算牌依据，不含任何手牌隐私）
+    if (this.trackers) {
+      const pub = cards.map(c => ({ id: c.id, suit: c.suit, rank: c.rank }));
+      for (const t of this.trackers) t.record(seat, pub, ev.play.type);
+    }
     this.turnStartedAt = Date.now();
     events.push({
       type: 'play', seat,
@@ -296,7 +309,8 @@ export class GameSession {
 
   // 机器人驱动：只要当前出牌权在机器人座位上，就持续自动出牌，
   // 直到轮到一个真人座位、或本副牌结束。返回收集到的事件列表。
-  driveBots() {
+  // 异步版本：机器人可调用大模型决策（每次决策带超时，失败降级启发式）
+  async driveBots() {
     const events = [];
     let guard = 0;
     for (;;) {
@@ -307,12 +321,31 @@ export class GameSession {
       const occupant = this.match.occupants[seat];
       if (!occupant || !String(occupant).startsWith('bot:')) break; // 轮到真人或空位
       if (!this.active(seat)) break;
-      const action = botDecide(this, seat);
+      let action;
+      try {
+        action = await botDecideAsync(this, seat);
+      } catch (e) {
+        action = botDecide(this, seat); // 双保险：AI层异常时用旧同步逻辑
+      }
       const res = this.handleAction(seat, action);
       if (!res.ok) {
-        // 机器人决策失败时兜底过牌，避免死循环
+        console.error('[driveBots] 机器人动作被拒', { seat, error: res.error, via: action && action.via, best: !!this.driver.best, handSize: this.match.round.hands[seat] && this.match.round.hands[seat].length });
+        if (!this.driver.best) {
+          // 领出被拒 → 终极保底：直接出手里最小的一张（首攻避开纯拖），绝不死锁
+          const hand = r.hands[seat].slice().sort((a, b) => orderValue(a.rank, r.level) - orderValue(b.rank, r.level));
+          const pick = hand.find(c => r.led || c.rank !== r.tug) || hand[0];
+          if (pick) {
+            const res2 = this.handleAction(seat, { type: 'play', cards: [{ id: pick.id }] });
+            if (res2.ok) { events.push(...res2.events); continue; }
+            console.error('[driveBots] 保底单张也被拒', { seat, error: res2.error });
+          }
+        }
+        // 跟牌被拒 → 兜底过牌
         const pass = this.handleAction(seat, { type: 'pass' });
-        if (!pass.ok) break;
+        if (!pass.ok) {
+          console.error('[driveBots] 兜底过牌也失败 → 牌局将卡死', { seat, error: pass.error });
+          break;
+        }
         events.push(...pass.events);
         continue;
       }
@@ -331,6 +364,7 @@ export class GameSession {
       totalRounds: this.match.totalRounds,
       level: r.level,
       tug: r.tug,
+      led: r.led,           // 本副首攻是否已出（首攻禁止纯拖牌，客户端据此提示）
       flip: r.flipCard ? cardLabel(r.flipCard) : null,
       teamOf: r.teamOf,
       names: this.seatNames(),

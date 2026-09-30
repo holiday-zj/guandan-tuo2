@@ -45,6 +45,8 @@ export function leadOptions(hand, level, cap = 120) {
   for (const r of RANKS) if (groups.has(r)) singles.push(groups.get(r)[0]);
   if (sj.length) singles.push(sj[0]);
   if (bj.length) singles.push(bj[0]);
+  // 逢人配也可单独作为级牌单张打出（否则手里只剩逢人配时无任何候选 → 死锁）
+  if (wilds.length) singles.push(wilds[0]);
   singles.sort((a, b) => orderValue(a.rank, level) - orderValue(b.rank, level));
   for (const c of singles) { if (push([c])) return done(out); }
 

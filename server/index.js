@@ -15,7 +15,7 @@ import {
   wxLogin, createRecharge, claimDailyFree, verifyIdentity, devFakePay, handlePayNotify,
 } from './pay.js';
 import { Lobby, GameSession } from './room.js';
-import { botDecide } from './bot.js';
+import { botDecide, botDecideAsync } from './bot.js';
 import { followOptions, leadOptions } from '../engine/hint.js';
 import { bestInterpretation } from '../engine/classify.js';
 
@@ -294,9 +294,10 @@ function handleMsg(member, msg) {
       const action = msg.type === 'pass' ? { type: 'pass' } : { type: 'play', cards: msg.cards || [] };
       const res = session.handleAction(seat, action);
       if (!res.ok) { ws.send({ type: 'error', error: res.error }); break; }
-      const botEvents = session.driveBots(); // 机器人接力，直到轮到真人
-      pushEvents(room.id, [...res.events, ...botEvents]);
+      pushEvents(room.id, res.events);
       scheduleTurnTimeout(room.id);
+      // 机器人接力（异步：AI 决策可能耗时，不阻塞 WS 消息循环）
+      driveBotsAsync(room.id);
       break;
     }
     case 'leave_room': {
@@ -360,7 +361,28 @@ function scheduleTurnTimeout(roomId) {
   turnTimers.set(roomId, timer);
 }
 
-function autoPlay(roomId) {
+// 机器人接力驱动（带并发锁：同一房间不会有两个循环同时跑）
+async function driveBotsAsync(roomId) {
+  const session = sessions.get(roomId);
+  if (!session || session._botBusy) return;
+  session._botBusy = true;
+  try {
+    const ev = await session.driveBots();
+    if (ev && ev.length) pushEvents(roomId, ev);
+  } catch (e) {
+    console.error('[driveBots] 异常', roomId, e.message || e);
+  } finally {
+    session._botBusy = false;
+    // 必须重排超时：若机器人循环异常中断且牌权仍在机器人手上，
+    // 否则没有任何东西再推进牌局 → 死锁（客户端表现为"卡住不动"）
+    const room = lobby.rooms.get(roomId);
+    if (room && room.state === 'playing' && session.match && session.match.round.state === 'playing') {
+      scheduleTurnTimeout(roomId);
+    }
+  }
+}
+
+async function autoPlay(roomId) {
   const session = sessions.get(roomId);
   const room = lobby.rooms.get(roomId);
   if (!session || !room || room.state !== 'playing') return;
@@ -368,10 +390,22 @@ function autoPlay(roomId) {
   if (r.state !== 'playing') return;
   const seat = session.driver.turn;
   const occupant = session.match.occupants[seat];
-  if (occupant && String(occupant).startsWith('bot:')) return; // 机器人由 driveBots 处理
+  if (occupant && String(occupant).startsWith('bot:')) {
+    // 轮到机器人却触发了超时：说明机器人循环没在跑（可能异常中断过），
+    // 主动拉起，否则牌局永久卡死
+    await driveBotsAsync(roomId);
+    return;
+  }
 
-  // 代打：能压就出最小的，否则过
-  const action = botDecide(session, seat);
+  // 代打：用 AI 决策（LLM 优先，失败降级启发式），比旧的极简逻辑强
+  let action;
+  try {
+    action = await botDecideAsync(session, seat);
+  } catch (e) {
+    action = botDecide(session, seat);
+  }
+  // 期间牌局可能已推进（别的动作插入），校验仍是该座位回合
+  if (session.driver.turn !== seat || r.state !== 'playing') return;
   const res = session.handleAction(seat, action);
   if (!res.ok) {
     const pass = session.handleAction(seat, { type: 'pass' });
@@ -380,9 +414,8 @@ function autoPlay(roomId) {
   } else {
     pushEvents(roomId, [{ type: 'auto_play', seat }, ...res.events]);
   }
-  const botEvents = session.driveBots();
-  if (botEvents.length) pushEvents(roomId, botEvents);
   scheduleTurnTimeout(roomId);
+  await driveBotsAsync(roomId);
 }
 
 function maybeStart(roomId, force = false) {
@@ -406,7 +439,6 @@ function maybeStart(roomId, force = false) {
   sessions.set(roomId, session);
   session.start();
   room.state = 'playing';
-  const botEvents = session.driveBots(); // 首出者是机器人时自动推进
 
   // 给每个真人推初始快照（按玩家身份定位，座位可能已被亮牌重排）
   for (const id of room.seats) {
@@ -415,9 +447,10 @@ function maybeStart(roomId, force = false) {
       if (cc && cc.ws) cc.ws.send({ type: 'game_start', seat: session.engineSeat(id), snapshot: session.snapshotFor(id) });
     }
   }
-  if (botEvents.length) pushEvents(roomId, botEvents);
   broadcast(roomId, { type: 'state', roundNum: session.roundNum, level: session.match.round.level });
   scheduleTurnTimeout(roomId);
+  // 首出者是机器人时自动推进（异步，不阻塞开局）
+  driveBotsAsync(roomId);
 }
 
 function pushEvents(roomId, events) {
