@@ -3,7 +3,7 @@
 // ⚠️ 上线前必须改这里：微信强制 HTTPS/WSS + 已备案域名，且域名要在
 //    微信公众平台「开发设置-服务器域名」白名单里配置（request 和 socket 两类）。
 //    当前是开发用的 HTTP+IP，只能在开发者工具勾选「不校验合法域名」时跑通。
-const SERVER_HOST = 'http://3.15.212.241:8080';   // TODO 上线改为 https://你的备案域名
+const SERVER_HOST = 'http://3.142.140.169:8080';   // TODO 上线改为 https://你的备案域名
 const WS_HOST = SERVER_HOST.replace(/^http/, 'ws'); // http→ws, https→wss
 const BASE = SERVER_HOST;
 const WS = WS_HOST;
