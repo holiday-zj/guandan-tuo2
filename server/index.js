@@ -32,20 +32,6 @@ const turnTimers = new Map(); // roomId -> timeout handle
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
 
-  // WebSocket 升级
-  if (req.headers.upgrade === 'websocket') {
-    const token = url.searchParams.get('token');
-    const member = store.authByToken(token);
-    if (!member) { res.writeHead(401); res.end('unauthorized'); return; }
-    const key = req.headers['sec-websocket-key'];
-    req.socket.write(
-      'HTTP/1.1 101 Switching Protocols\r\n' +
-      'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
-      'Sec-WebSocket-Accept: ' + acceptKey(key) + '\r\n\r\n');
-    attachWs(req.socket, member);
-    return;
-  }
-
   // 静态网页版试玩客户端
   if (url.pathname === '/' || url.pathname.startsWith('/web/')) {
     const rel = url.pathname === '/' ? 'index.html' : url.pathname.slice('/web/'.length);
@@ -128,6 +114,37 @@ function handleApi(path, method, data) {
         keyLen: st.keyLen, thinkMinMs: Number(process.env.BOT_THINK_MIN || 400),
         llmTimeoutMs: Number(process.env.BOT_LLM_TIMEOUT || 9000),
       };
+    }
+    case '/api/debug/rooms': {
+      // 调试：每个进行中对局的关键状态（定位卡顿用）
+      const out = [];
+      for (const [rid, s] of sessions) {
+        const r = s.match ? s.match.round : null;
+        out.push({
+          room: rid,
+          botBusy: !!s._botBusy,
+          busyHeldMs: s._botBusySince ? Date.now() - s._botBusySince : 0,
+          occupants: s.match ? s.match.occupants.map(String) : null,
+          turn: s.driver ? s.driver.turn : null,
+          roundState: r ? r.state : null,
+          roundNum: s.roundNum,
+          handCounts: r && r.hands ? r.hands.map(h => (h ? h.length : 0)) : null,
+          bestBy: s.driver && s.driver.best ? s.driver.best.by : null,
+          finishOrder: r ? r.finishOrder : null,
+          teamOf: r ? r.teamOf : null,
+          passes: s.driver ? s.driver.consecutivePasses : null,
+          lastPushAt: s._lastPushAt || null,
+          humanWsAlive: (() => {
+            if (!s.match) return null;
+            return s.match.occupants.map((id, i) => {
+              if (!id || String(id).startsWith('bot:')) return null;
+              const cc = clients.get(id);
+              return { seat: i, id: String(id), hasClient: !!cc, wsAlive: !!(cc && cc.ws) };
+            }).filter(Boolean);
+          })(),
+        });
+      }
+      return { ok: true, sessions: out };
     }
     default:
       throw new Error('unknown path: ' + path);
@@ -218,13 +235,16 @@ function attachWs(socket, member) {
       }
     }
   });
-  socket.on('close', () => {
+  socket.on('close', (hadError) => {
     // 断线保留座位 5 分钟（超时由托管机制自动出牌）
+    console.log(`[ws] socket关闭 member=${member.id} hadError=${hadError} destroyed=${socket.destroyed}`);
     const c = clients.get(member.id);
-    if (c) c.ws = null;
+    if (c && c.ws === ws) c.ws = null;
     lobby.dequeue(member.id);
   });
-  socket.on('error', () => {});
+  socket.on('error', (e) => {
+    console.log(`[ws] socket错误 member=${member.id}: ${e.message}`);
+  });
 }
 
 function handleMsg(member, msg) {
@@ -303,7 +323,11 @@ function handleMsg(member, msg) {
       if (seat < 0) { ws.send({ type: 'error', error: '不在本局中' }); break; }
       const action = msg.type === 'pass' ? { type: 'pass' } : { type: 'play', cards: msg.cards || [] };
       const res = session.handleAction(seat, action);
-      if (!res.ok) { ws.send({ type: 'error', error: res.error }); break; }
+      if (!res.ok) {
+        if (process.env.BOT_TRACE) console.log(`[trace] 真人动作被拒 room=${room.id} seat=${seat} err=${res.error} → 不调用driveBots`);
+        ws.send({ type: 'error', error: res.error }); break;
+      }
+      if (process.env.BOT_TRACE) console.log(`[trace] 真人动作OK room=${room.id} seat=${seat} ${action.type} → 调driveBots, turn=${session.driver.turn}`);
       pushEvents(room.id, res.events);
       scheduleTurnTimeout(room.id);
       // 机器人接力（异步：AI 决策可能耗时，不阻塞 WS 消息循环）
@@ -365,24 +389,49 @@ function handleMsg(member, msg) {
 }
 
 // —— 超时托管：轮到某真人超过时限未出牌，服务端代打 ——
-function scheduleTurnTimeout(roomId) {
+// delayMs 可选：用于"机器人忙时短间隔复查"，避免循环意外退出后无人接管而永久卡死
+function scheduleTurnTimeout(roomId, delayMs) {
   clearTimeout(turnTimers.get(roomId));
-  const timer = setTimeout(() => autoPlay(roomId), TURN_TIMEOUT_MS);
+  const timer = setTimeout(() => autoPlay(roomId), delayMs || TURN_TIMEOUT_MS);
   turnTimers.set(roomId, timer);
 }
 
 // 机器人接力驱动（带并发锁：同一房间不会有两个循环同时跑）
 async function driveBotsAsync(roomId) {
+  const T = () => new Date().toISOString().slice(11, 23);
+  if (process.env.BOT_TRACE) console.log(`[trace ${T()}] driveBotsAsync 进入 room=${roomId}`);
   const session = sessions.get(roomId);
-  if (!session || session._botBusy) return;
+  if (!session) { if (process.env.BOT_TRACE) console.log(`[trace ${T()}] driveBotsAsync 无session 退出`); return; }
+  if (session._botBusy) {
+    // 已有循环在跑。防冻结保险：判定依据是"距上次牌局进展的时长"而非锁持有时长——
+    // 健康的循环在机器人连续持牌权时可合法运行很久（每步~2s都在推进）；
+    // 真挂起则表现为长时间零进展（单次决策硬超时12s，30s无进展必为异常）。
+    // 曾误用锁持有时长(20s)把健康长循环强杀，引发双循环并发打架("还没轮到你")。
+    const idleMs = Date.now() - (session._botProgressAt || session._botBusySince || Date.now());
+    const STALL_MS = 30000;
+    if (idleMs > STALL_MS) {
+      console.error(`[driveBots] 循环无进展已${idleMs}ms，强制回收锁 room=${roomId}`);
+      session._botBusy = false;
+    } else {
+      // 循环仍在正常推进：安排一次短超时复查，防止它因故退出后无人接管
+      if (process.env.BOT_TRACE) console.log(`[trace ${T()}] driveBotsAsync 被拒(busy, 距上次进展${idleMs}ms) room=${roomId} → 5秒后复查`);
+      scheduleTurnTimeout(roomId, 5000);
+      return;
+    }
+  }
   session._botBusy = true;
+  session._botBusySince = Date.now();
+  const startedAt = Date.now();
   try {
-    const ev = await session.driveBots();
-    if (ev && ev.length) pushEvents(roomId, ev);
+    // onFlush: 每步立即推送，客户端实时看到机器人出牌（LLM每手1~2秒，攒批会像冻结）
+    const ev = await session.driveBots(batch => pushEvents(roomId, batch));
+    if (process.env.BOT_TRACE) console.log(`[trace] driveBots完成 room=${roomId} 耗时${Date.now() - startedAt}ms 事件${ev ? ev.length : 0} turn→${session.driver ? session.driver.turn : '?'}`);
   } catch (e) {
     console.error('[driveBots] 异常', roomId, e.message || e);
   } finally {
     session._botBusy = false;
+    session._botBusySince = 0;
+    session._botProgressAt = 0;
     // 必须重排超时：若机器人循环异常中断且牌权仍在机器人手上，
     // 否则没有任何东西再推进牌局 → 死锁（客户端表现为"卡住不动"）
     const room = lobby.rooms.get(roomId);
@@ -407,6 +456,7 @@ async function autoPlay(roomId) {
     return;
   }
 
+  if (process.env.BOT_TRACE) console.log(`[trace ${new Date().toISOString().slice(11, 23)}] autoPlay 触发 room=${roomId} seat=${seat}(真人超时托管)`);
   // 代打：用 AI 决策（LLM 优先，失败降级启发式），比旧的极简逻辑强
   let action;
   try {
@@ -470,6 +520,7 @@ function pushEvents(roomId, events) {
     if (ev.type === 'round_result') settleWallet(session, ev.result);
     if (ev.type === 'match_over') finishMatch(session);
   }
+  session._lastPushAt = Date.now();
   broadcast(roomId, { type: 'events', events });
   // 推送最新快照给每位真人（按玩家身份定位）
   const room = lobby.rooms.get(roomId);
@@ -477,7 +528,11 @@ function pushEvents(roomId, events) {
     for (const id of room.seats) {
       if (id && !String(id).startsWith('bot:')) {
         const cc = clients.get(id);
-        if (cc && cc.ws) cc.ws.send({ type: 'snapshot', snapshot: session.snapshotFor(id) });
+        if (cc && cc.ws) {
+          cc.ws.send({ type: 'snapshot', snapshot: session.snapshotFor(id) });
+        } else if (process.env.BOT_TRACE) {
+          console.log(`[trace] pushEvents: 真人${id} 无活跃ws(hasClient=${!!cc}) → 快照未送达`);
+        }
       }
     }
   }
@@ -554,6 +609,29 @@ function broadcastRoom(roomId) {
   const nameOf = id => { const m = loadMember(id); return m ? m.name : null; };
   broadcast(roomId, { type: 'room_state', seats: room.names(nameOf), state: room.state, stake: room.stake });
 }
+
+// —— WebSocket 升级（必须走 server 的 upgrade 事件）——
+// ⚠️ 曾把它写在 http.createServer 请求处理器里，HTTP 默认 300s requestTimeout
+// 会把升级后的 WS socket 当"未完成请求"杀掉（socket错误: Request timeout），
+// 导致对局中途全员断线、牌局冻结。upgrade 事件拿到的是裸 socket，不受该超时约束。
+server.on('upgrade', (req, socket, head) => {
+  try {
+    const url = new URL(req.url, 'http://x');
+    const token = url.searchParams.get('token');
+    const member = store.authByToken(token);
+    if (!member) { socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return; }
+    const key = req.headers['sec-websocket-key'];
+    socket.write(
+      'HTTP/1.1 101 Switching Protocols\r\n' +
+      'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
+      'Sec-WebSocket-Accept: ' + acceptKey(key) + '\r\n\r\n');
+    if (head && head.length) socket.unshift(head);
+    attachWs(socket, member);
+  } catch (e) {
+    console.error('[upgrade] 握手失败', e.message || e);
+    try { socket.destroy(); } catch {}
+  }
+});
 
 server.listen(PORT, () => {
   console.log(`[掼蛋·拖2] 服务端已启动：http://127.0.0.1:${PORT}`);

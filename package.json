@@ -5,6 +5,9 @@
   "type": "module",
   "scripts": {
     "test": "node --test test/classify.test.js test/settle.test.js test/hint.test.js",
+    "test:ai": "LLM_DISABLE=1 node --test test/ai-analyze.test.js test/ai-decide.test.js test/ai-deadlock.test.js",
+    "test:bot-match": "node test/bot-match.test.js",
+    "llm-check": "node test/llm-check.js",
     "test:e2e": "node test/e2e.test.js",
     "test:integration": "node test/integration.test.js",
     "test:pay": "node test/pay.test.js && node test/wx-login.test.js",

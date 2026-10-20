@@ -38,7 +38,8 @@ class WsClient {
         }
         this.buf = Buffer.concat([this.buf, chunk]); this.pump();
       });
-      socket.on('error', reject);
+      socket.on('error', e => { console.log('[client] socket错误:', e.message); reject(e); });
+      socket.on('close', () => console.log('[client] ⚠️ socket被关闭! 之后收不到任何消息'));
       this.socket = socket;
     });
   }
@@ -107,6 +108,11 @@ function decide(snap, seat) {
 }
 
 async function main() {
+  // 防呆：确认服务端健康且没有僵尸进程占端口（曾发生 e2e 连到旧代码进程白测一轮）
+  const health = await (await fetch('http://127.0.0.1:8080/api/health')).json();
+  if (!health.ok) throw new Error('服务端不健康');
+  console.log('✓ 服务端健康, payEnabled=' + health.payEnabled);
+
   const name = '真人_' + Date.now().toString(36);
   const reg = await post('/api/register', { name, password: 'test123' });
   if (!reg.ok) throw new Error('注册失败: ' + JSON.stringify(reg));
@@ -178,21 +184,34 @@ async function main() {
       }
     } else {
       await new Promise(r => setTimeout(r, 50));
-      // 看门狗：超过8秒牌权都不在我手上且牌局无进展 → 打印诊断并退出
+      // 看门狗：牌局无进展超过阈值 → 打印诊断并退出
+      // 阈值需大于 LLM 决策延迟(~2s/手)+回合超时(30s)，否则大模型模式下误报卡顿
       const snap2 = c.latest(m => m.type === 'snapshot' || m.type === 'game_start');
       if (snap2 && snap2.snapshot && Date.now() - t0 > 8000 && actions > 0) {
         const s = snap2.snapshot;
         const stallKey = s.roundNum + ':' + s.turn + ':' + s.handCounts.join(',') + ':' + (s.best ? s.best.by : 'L');
         if (stallKey === lastStallKey) {
           stallSince = stallSince || Date.now();
-          if (Date.now() - stallSince > 8000) {
+          if (Date.now() - stallSince > 45000) {
             console.log('\n⚠ 牌局卡顿诊断:');
             console.log('  roundNum=', s.roundNum, ' turn=', s.turn, ' mySeat=', s.mySeat);
             console.log('  handCounts=', s.handCounts.join(','), ' finishOrder=', s.finishOrder);
             console.log('  best=', s.best ? `seat${s.best.by} ${s.best.shape}` : 'null(领出)');
             console.log('  turnDeadline=', s.turnDeadline, 'now=', Date.now(), '已过', Date.now() - s.turnDeadline, 'ms');
             console.log('  真人出手数=', actions, ' 已完成副数=', seenEvents.filter(e => e.type === 'round_result').length);
-            assert.fail('牌局卡顿超过8秒: ' + JSON.stringify({ roundNum: s.roundNum, turn: s.turn, mySeat: s.mySeat, handCounts: s.handCounts }));
+            // 关键取证：客户端收到的消息序列 + 服务端内部状态
+            console.log('  --- 客户端inbox尾部12条 ---');
+            for (const m of c.inbox.slice(-12)) {
+              if (m.type === 'snapshot') console.log(`    snapshot turn=${m.snapshot.turn} mySeat=${m.snapshot.mySeat} hands=[${m.snapshot.handCounts}]`);
+              else if (m.type === 'events') console.log(`    events: ${m.events.map(e => e.type + (e.seat !== undefined ? '@' + e.seat : '')).join(',')}`);
+              else console.log('    ' + m.type + ': ' + JSON.stringify(m).slice(0, 100));
+            }
+            try {
+              const dbg = await (await fetch('http://127.0.0.1:8080/api/debug/rooms')).json();
+              console.log('  --- 服务端内部状态 ---');
+              console.log('  ' + JSON.stringify(dbg.sessions));
+            } catch (e) { console.log('  debug端点失败:', e.message); }
+            assert.fail('牌局卡顿超过45秒: ' + JSON.stringify({ roundNum: s.roundNum, turn: s.turn, mySeat: s.mySeat, handCounts: s.handCounts }));
           }
         } else { lastStallKey = stallKey; stallSince = 0; }
       }

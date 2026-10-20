@@ -310,20 +310,27 @@ export class GameSession {
   // 机器人驱动：只要当前出牌权在机器人座位上，就持续自动出牌，
   // 直到轮到一个真人座位、或本副牌结束。返回收集到的事件列表。
   // 异步版本：机器人可调用大模型决策（每次决策带超时，失败降级启发式）
-  async driveBots() {
+  // onFlush: 每完成一步立即回调推送事件——LLM 决策每手1~2秒，机器人连续行动阶段
+  // 若攒到循环结束才推送，客户端会几十秒收不到任何快照，表现为"牌局冻结"
+  async driveBots(onFlush = null) {
     const events = [];
     let guard = 0;
+    this._botProgressAt = Date.now(); // 每推进一步刷新；外部用"距上次进展时长"判断循环是否真挂起
+    const trace = process.env.BOT_TRACE ? (...a) => console.log('[trace]', ...a) : () => {};
     for (;;) {
-      if (++guard > 5000) break; // 保险
+      if (++guard > 5000) { trace('break: guard'); break; } // 保险
       const r = this.match.round;
-      if (r.state !== 'playing') break;
+      if (r.state !== 'playing') { trace('break: round state=' + r.state); break; }
       const seat = this.driver.turn;
       const occupant = this.match.occupants[seat];
-      if (!occupant || !String(occupant).startsWith('bot:')) break; // 轮到真人或空位
-      if (!this.active(seat)) break;
+      if (!occupant || !String(occupant).startsWith('bot:')) { trace(`break: seat${seat} 非机器人(${occupant})`); break; } // 轮到真人或空位
+      if (!this.active(seat)) { trace(`break: seat${seat} 已出完但牌权在其手上 → 死锁!`); break; }
       let action;
       try {
+        const td = Date.now();
+        if (process.env.BOT_TRACE) console.log(`[trace ${new Date().toISOString().slice(11, 23)}] seat${seat} 决策开始`);
         action = await botDecideAsync(this, seat);
+        if (process.env.BOT_TRACE) console.log(`[trace] seat${seat} 决策结束 耗时${Date.now() - td}ms via=${action && action.via}`);
       } catch (e) {
         action = botDecide(this, seat); // 双保险：AI层异常时用旧同步逻辑
       }
@@ -350,6 +357,9 @@ export class GameSession {
         continue;
       }
       events.push(...res.events);
+      this._botProgressAt = Date.now();
+      if (onFlush) { try { onFlush(res.events); } catch (e) { console.error('[driveBots] onFlush异常', e.message || e); } }
+      trace(`seat${seat} ${action.type} ok, turn→${this.driver.turn}, round=${r.state}`);
     }
     return events;
   }

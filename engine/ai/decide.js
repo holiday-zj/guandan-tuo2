@@ -325,8 +325,17 @@ export async function decideAsync(session, seat, trackerMap, opts = {}) {
   };
 
   // LLM 主决策（失败自动降级启发式，永不阻塞游戏）
+  // 双保险：除 askJson 内部超时外，这里再加一层硬性总超时——
+  // 任何原因（含未预见的挂起）超过 HARD_TIMEOUT 立即走启发式，牌局绝不卡死
+  const HARD_TIMEOUT = Number(process.env.BOT_LLM_TIMEOUT || 9000) + 3000;
   try {
-    const action = await llmDecide(ctx, opts);
+    const action = await Promise.race([
+      llmDecide(ctx, opts),
+      new Promise(resolve => setTimeout(() => resolve(null), HARD_TIMEOUT)),
+    ]);
+    if (!action) {
+      return { ...heuristicDecide(ctx), via: 'hard-timeout-fallback' };
+    }
     action.llm = true;
     return action;
   } catch (e) {

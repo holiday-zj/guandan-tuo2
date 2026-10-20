@@ -29,9 +29,11 @@ function loadEnv() {
 let cfg = loadEnv();
 
 export function llmStatus() {
-  const enabled = !!(cfg.LLM_KEY && cfg.LLM_KEY.length >= 20);
+  const disabled = process.env.LLM_DISABLE === '1'; // 测试/离线模式：强制走启发式，不发起真实API调用
+  const enabled = !disabled && !!(cfg.LLM_KEY && cfg.LLM_KEY.length >= 20);
   return {
     enabled,
+    disabledByEnv: disabled,
     base: cfg.LLM_BASE || '(未配置)',
     model: cfg.LLM_MODEL || '(未配置)',
     fastModel: cfg.LLM_FAST_MODEL || '(未配置)',
@@ -58,7 +60,7 @@ function cacheKey(model, messages) {
  */
 export async function askJson(systemPrompt, userPrompt, opts = {}) {
   const model = opts.fast ? (cfg.LLM_FAST_MODEL || cfg.LLM_MODEL) : (cfg.LLM_MODEL || cfg.LLM_FAST_MODEL);
-  if (!cfg.LLM_KEY || !model) {
+  if (process.env.LLM_DISABLE === '1' || !cfg.LLM_KEY || !model) {
     return { ok: false, ms: 0, error: 'LLM_NOT_CONFIGURED' };
   }
   const messages = [
@@ -85,15 +87,21 @@ export async function askJson(systemPrompt, userPrompt, opts = {}) {
         temperature: opts.temperature ?? 0.3,
         max_tokens: opts.maxTokens ?? 400,
         response_format: { type: 'json_object' },
+        // 关闭深度思考：实测 qwen3.8-max 开启思考时每手 10~47 秒（游戏不可用），
+        // 关闭后降到 ~2 秒且出牌质量不降。可用 LLM_THINKING=true 恢复思考模式。
+        ...(process.env.LLM_THINKING === 'true' ? {} : { enable_thinking: false }),
       }),
       signal: ac.signal,
     });
-    clearTimeout(timer);
     if (!resp.ok) {
       const txt = (await resp.text()).slice(0, 200);
       return { ok: false, ms: Date.now() - t0, error: `HTTP ${resp.status}: ${txt}` };
     }
+    // ⚠️ 关键：abort 定时器必须覆盖到响应体读取完成。
+    // 曾因收到响应头后就 clearTimeout，若 API 响应体卡住（限流/网络抖动），
+    // resp.json() 永久挂起 → 机器人决策卡死整局（真实事故）
     const d = await resp.json();
+    clearTimeout(timer);
     const raw = d?.choices?.[0]?.message?.content || '';
     const data = extractJson(raw);
     if (!data) return { ok: false, ms: Date.now() - t0, raw, error: 'JSON_PARSE_FAILED' };
