@@ -6,7 +6,8 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ENV_FILE = path.resolve(__dirname, '../data/llm.env');
+// engine/ai/ → engine/ → 项目根 → data/llm.env（曾误写 '../data/' 导致永远读不到配置、静默降级）
+const ENV_FILE = path.resolve(__dirname, '../../data/llm.env');
 
 function loadEnv() {
   const cfg = {};

@@ -18,6 +18,7 @@ import { Lobby, GameSession } from './room.js';
 import { botDecide, botDecideAsync } from './bot.js';
 import { followOptions, leadOptions } from '../engine/hint.js';
 import { bestInterpretation } from '../engine/classify.js';
+import { llmStatus } from '../engine/ai/llm.js';
 
 const PORT = process.env.PORT || 8080;
 const TURN_TIMEOUT_MS = 30000; // 30秒不出牌自动托管出牌
@@ -119,6 +120,15 @@ function handleApi(path, method, data) {
       return { ok: true, rooms: lobby.publicList(), queue: lobby.queue.length };
     case '/api/health':
       return { ok: true, time: Date.now(), payEnabled: config.payEnabled };
+    case '/api/ai/status': {
+      // 机器人AI状态：大模型是否已启用（不暴露任何密钥内容）
+      const st = llmStatus();
+      return {
+        ok: true, llmEnabled: st.enabled, base: st.base, model: st.model,
+        keyLen: st.keyLen, thinkMinMs: Number(process.env.BOT_THINK_MIN || 400),
+        llmTimeoutMs: Number(process.env.BOT_LLM_TIMEOUT || 9000),
+      };
+    }
     default:
       throw new Error('unknown path: ' + path);
   }
