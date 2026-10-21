@@ -456,7 +456,7 @@ function playFx(seat, shape, byMe){
 function playAreaPos(seat){
   const s=ui.snap;
   if(!s||seat==null) return {x:W/2,y:H/2};
-  if(seat===ui.mySeat) return {x:W/2,y:250};
+  if(seat===ui.mySeat) return {x:W/2,y:470};   // 与 drawPlayArea 保持一致（手牌正上方）
   const rel=(seat-ui.mySeat+4)%4;
   if(rel===1) return {x:W-300,y:300};
   if(rel===2) return {x:W/2,y:130};
@@ -850,9 +850,9 @@ function renderGame(){
   if(s.turn===rightSeat) drawCountdown(W-320, 242);
   drawPlayArea(rightSeat, W-300, 300);
 
-  // 我的出牌区（中央偏上）
-  drawPlayArea(ui.mySeat, W/2, 250);
-  if(s.turn===ui.mySeat) drawCountdown(W/2, 210, true);
+  // 我的出牌区（手牌正上方，与对家出牌区明显分开）
+  drawPlayArea(ui.mySeat, W/2, 470);
+  if(s.turn===ui.mySeat) drawCountdown(W/2, 430, true);
 
   // —— 手牌区 ——
   if(ui.sortMode==='grid') renderHandGrid(s);     // 矩阵摆牌（默认：点数横排、同点数竖叠、同花色尽量同行）
