@@ -82,7 +82,8 @@ test('整副对局：3机器人+1极简真人跑完8副不死锁（服务端同�
     const r = new Round([0, 1, 2, 3], [0, 1, 0, 1]);
     r.deal();
     const info = r.flip();
-    r.applyFlip(info);
+    // 与生产 Match.newRound() 一致：强制队伍0坐0/2、队伍1坐1/3（对角）
+    r.applyFlip({ ...info, teamOf: [0, 1, 0, 1] });
     r.startPlay(0);
     const trackers = [0, 1, 2, 3].map(() => { const t = new PlayTracker(); t.reset(r.level, r.tug); return t; });
     let guard = 0;
