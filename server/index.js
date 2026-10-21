@@ -15,7 +15,7 @@ import {
   wxLogin, createRecharge, claimDailyFree, verifyIdentity, devFakePay, handlePayNotify,
 } from './pay.js';
 import { Lobby, GameSession } from './room.js';
-import { botDecide, botDecideAsync } from './bot.js';
+import { botDecide, botDecideAsync, playerHint } from './bot.js';
 import { followOptions, leadOptions } from '../engine/hint.js';
 import { bestInterpretation } from '../engine/classify.js';
 import { llmStatus } from '../engine/ai/llm.js';
@@ -302,15 +302,19 @@ function handleMsg(member, msg) {
       if (seat < 0) { ws.send({ type: 'error', error: '不在本局中' }); break; }
       const r = session.match.round;
       if (r.state !== 'playing' || session.driver.turn !== seat) { ws.send({ type: 'error', error: '未到你的回合' }); break; }
-      let opts;
-      if (session.driver.best) {
-        opts = followOptions(r.hands[seat], r.level, session.driver.best.it, 8);
-      } else {
-        opts = leadOptions(r.hands[seat], r.level, 8);
-        // 首攻禁拖：排除纯拖牌的领出候选
-        if (!r.led) opts = opts.filter(o => !o.cards.every(c => c.rank === r.tug));
-      }
-      ws.send({ type: 'hint', options: opts.map(o => o.cards.map(card => ({ id: card.id, suit: card.suit, rank: card.rank }))) });
+      // 用大模型给出推荐（与机器人同一套 AI：算牌+记忆+结构标注），带理由；失败自动降级
+      (async () => {
+        const h = await playerHint(session, seat);
+        // 回合可能已变（玩家等提示期间超时托管）：仍返回结果，客户端会自行忽略过期提示
+        const opts = (h.options || []).map(cards => cards.map(card => {
+          const src = r.hands[seat].find(x => x.id === card.id);
+          return src ? { id: src.id, suit: src.suit, rank: src.rank } : { id: card.id };
+        }));
+        ws.send({ type: 'hint', options: opts, reason: h.reason || '', action: h.action, via: h.via });
+      })().catch(e => {
+        console.error('[hint] 异常', e.message || e);
+        try { ws.send({ type: 'error', error: '提示生成失败，请重试' }); } catch {}
+      });
       break;
     }
     case 'play':

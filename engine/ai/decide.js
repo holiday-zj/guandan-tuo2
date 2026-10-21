@@ -334,8 +334,9 @@ ${best ? '（也可以选择 pass 过牌）' : '（领出必须出牌，不能pa
   return { type: 'play', cards: pick.cards.map(x => ({ id: x.id })), via: 'llm', reason: d.reason, picked: candidateLabel(pick, level, tug) };
 }
 
-// ————— 统一入口：构造上下文 + LLM(带保底) —————
-export async function decideAsync(session, seat, trackerMap, opts = {}) {
+// ————— 构造决策上下文（机器人决策与玩家提示共用同一套 AI 分析）—————
+// 返回 {ctx, early}：early 非空表示已有确定结论（无候选/锁牌圈/紧急保底），无需再问大模型
+export function buildDecisionContext(session, seat, trackerMap) {
   const round = session.match.round;
   const driver = session.driver;
   const hand = round.hands[seat];
@@ -372,9 +373,9 @@ export async function decideAsync(session, seat, trackerMap, opts = {}) {
   const candidates = buildCandidates(hand, level, best);
 
   // 领出且无任何候选 → 紧急保底出牌，绝不让牌局卡死
-  if (!best && !candidates.length) return emergencyLead();
+  if (!best && !candidates.length) return { ctx: null, early: emergencyLead() };
   if (!candidates.length && best) {
-    return { type: 'pass', via: 'no-candidates' };
+    return { ctx: null, early: { type: 'pass', via: 'no-candidates' } };
   }
 
   // 首攻禁纯拖过滤（引擎也会拒绝，这里提前滤掉避免 LLM 选到非法候选）
@@ -385,7 +386,7 @@ export async function decideAsync(session, seat, trackerMap, opts = {}) {
   }
   // 锁定牌圈（头游纯拖）：只能过
   if (best && round.trick && round.trick.locked) {
-    return { type: 'pass', via: 'locked-trick' };
+    return { ctx: null, early: { type: 'pass', via: 'locked-trick' } };
   }
 
   const ctx = {
@@ -394,6 +395,55 @@ export async function decideAsync(session, seat, trackerMap, opts = {}) {
     memory: session.memory || null,
     isFirstLead: !round.led,
   };
+  return { ctx, early: null };
+}
+
+// ————— 玩家提示：用大模型给出推荐出牌 + 理由（与机器人同一套分析）—————
+// 返回 {action, reason, options}：options 为候选牌（id列表数组，供客户端循环高亮）
+export async function hintAsync(session, seat, trackerMap, opts = {}) {
+  const { ctx, early } = buildDecisionContext(session, seat, trackerMap);
+  // 无候选/锁牌圈等确定局面：直接返回结论，不调用大模型
+  if (early) {
+    const options = early.type === 'play' ? [early.cards] : [];
+    return {
+      action: early.type, reason: early.type === 'pass' ? '没有能压的牌或牌圈已锁定，建议过' : '',
+      options, via: early.via,
+    };
+  }
+  // 候选牌的 id 列表（客户端据此高亮/选中）
+  const options = ctx.candidates.map(c => c.cards.map(x => ({ id: x.id })));
+
+  // 大模型推荐（超时/失败则用启发式结果，保证提示永远有值）
+  const HARD_TIMEOUT = Number(process.env.HINT_LLM_TIMEOUT || 8000);
+  try {
+    const action = await Promise.race([
+      llmDecide(ctx, { ...opts, timeoutMs: Math.min(opts.timeoutMs || 8000, HARD_TIMEOUT) }),
+      new Promise(resolve => setTimeout(() => resolve(null), HARD_TIMEOUT + 1500)),
+    ]);
+    const chosen = (action && action.type === 'play' && action.cards)
+      ? [action.cards] : null;
+    return {
+      action: action ? action.type : 'play',
+      reason: action && action.reason ? action.reason : '',
+      // 首选放最前（大模型推荐），其余候选跟随，客户端可循环切换
+      options: chosen ? [chosen[0], ...options.filter(o => o !== chosen[0])] : options,
+      via: action ? (action.via || 'llm') : 'heuristic-fallback',
+    };
+  } catch (e) {
+    const h = heuristicDecide(ctx);
+    const chosen = h.type === 'play' && h.cards ? [h.cards] : null;
+    return {
+      action: h.type, reason: '',
+      options: chosen ? [chosen[0], ...options.filter(o => o !== chosen[0])] : options,
+      via: 'exception-fallback',
+    };
+  }
+}
+
+// ————— 统一入口：构造上下文 + LLM(带保底) —————
+export async function decideAsync(session, seat, trackerMap, opts = {}) {
+  const { ctx, early } = buildDecisionContext(session, seat, trackerMap);
+  if (early) return early;
 
   // 决策后把自己的判断记入记忆（计划连续性，供后续决策参考）
   const rememberPlan = (action) => {

@@ -972,13 +972,17 @@ function renderHandSingle(s){
 
 async function doHint(){
   api.send({type:'hint'});
+  toast('🤖 大模型思考中…', 2000);
   try{
-    const d = await api.wait('hint',3000);
-    if(!d.options.length) return toast('没有能压的牌，建议过');
+    const d = await api.wait('hint',9000);
+    if(d.action==='pass' || !d.options.length) return toast(d.reason || '没有能压的牌，建议过', 4000);
     ui.hintOpts = d.options;
     ui.hintIdx = (ui.hintIdx+1)%ui.hintOpts.length;
     ui.selected = new Set(ui.hintOpts[ui.hintIdx].map(c=>c.id));
-  }catch{ toast('暂时无提示'); }
+    // 显示大模型推荐理由（首选置顶，再点提示可循环切换其他候选）
+    if(d.reason) banner('💡 '+d.reason, 5000);
+    else toast('推荐已选中，再点提示可切换其他选法', 2600);
+  }catch{ toast('提示超时，请重试'); }
 }
 function doPlay(){
   const cards=[...ui.selected].map(id=>({id}));

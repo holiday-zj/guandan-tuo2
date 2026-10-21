@@ -416,14 +416,17 @@ function cardLabel(c) {
 async function doHint() {
   if (!ui.snapshot) return;
   net.send({ type: 'hint' });
+  toast('🤖 大模型思考中…', 2000);
   try {
-    const d = await net.wait('hint', () => true, 3000);
-    if (!d.options.length) { toast('没有能压的牌，建议过'); return; }
+    const d = await net.wait('hint', () => true, 9000);
+    if (d.action === 'pass' || !d.options.length) { toast(d.reason || '没有能压的牌，建议过', 4000); return; }
     ui.hintOptions = d.options;
     ui.hintIndex = (ui.hintIndex + 1) % ui.hintOptions.length;
     ui.selected = new Set(ui.hintOptions[ui.hintIndex].map(c => c.id));
+    if (d.reason) toast('💡 ' + d.reason, 5000);
+    else toast('推荐已选中，再点提示可切换', 2600);
   } catch (e) {
-    toast('暂时无提示');
+    toast('提示超时，请重试');
   }
 }
 

@@ -2,12 +2,14 @@
 //   botDecide      —— 旧同步极简逻辑（保底，AI层异常时使用）
 //   botDecideAsync —— 主决策：LLM 出牌（大模型判断）+ 启发式保底，永不阻塞
 import { bestInterpretation, canBeat } from '../engine/classify.js';
-import { decideAsync } from '../engine/ai/decide.js';
+import { decideAsync, hintAsync } from '../engine/ai/decide.js';
 
 // 机器人思考时间下限（毫秒）：让节奏自然，也避免LLM未配置时刷屏
 const THINK_MIN_MS = Number(process.env.BOT_THINK_MIN || 400);
 // 单次 LLM 决策超时（毫秒），超时自动降级启发式
 const LLM_TIMEOUT_MS = Number(process.env.BOT_LLM_TIMEOUT || 9000);
+// 玩家提示的 LLM 超时（提示可稍短，玩家会等）
+const HINT_TIMEOUT_MS = Number(process.env.HINT_LLM_TIMEOUT || 8000);
 
 function valueOf(c, level) {
   return c.rank === 'BJ' ? 17 : c.rank === 'SJ' ? 16 : c.rank === level ? 15 : '23456789TJQKA'.indexOf(c.rank) + 2;
@@ -63,3 +65,25 @@ export function botDecide(session, seat) {
   }
   return { type: 'pass' };
 }
+
+// 玩家提示：调用大模型给出推荐出牌 + 理由（与机器人同一套 AI 分析）
+// 返回 {action, reason, options, via}；options 为候选牌id数组（首选已置顶）
+export async function playerHint(session, seat) {
+  try {
+    const r = await hintAsync(session, seat, session.trackers || null, { timeoutMs: HINT_TIMEOUT_MS });
+    if (process.env.BOT_DEBUG) {
+      console.log('[hint]', { seat, via: r.via, action: r.action, reason: r.reason, n: r.options.length });
+    }
+    return r;
+  } catch (e) {
+    // 兜底：AI层整体异常时退回旧同步逻辑，保证提示功能永远可用
+    const fallback = botDecide(session, seat);
+    return {
+      action: fallback.type,
+      reason: '',
+      options: fallback.type === 'play' ? [fallback.cards] : [],
+      via: 'exception:' + (e.message || e),
+    };
+  }
+}
+
