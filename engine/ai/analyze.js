@@ -25,16 +25,33 @@ export class PlayTracker {
     this.finishOrder = [];
   }
 
-  // 记录一次公开动作（cards=null 表示过牌）
-  record(seat, cards, shape) {
+  // 记录一次公开动作（cards=null 表示过牌；passedOn=过牌时压不过的牌圈信息）
+  record(seat, cards, shape, passedOn = null) {
     if (!cards || !cards.length) {
       this.passCount[seat] = (this.passCount[seat] || 0) + 1;
-      this.plays.push({ seat, cards: null, shape: 'pass' });
+      this.plays.push({ seat, cards: null, shape: 'pass', passedOn });
       return;
     }
     this.plays.push({ seat, cards, shape });
     this.playedBySeat[seat] += cards.length;
     for (const c of cards) this.seenRank[c.rank] = (this.seenRank[c.rank] || 0) + 1;
+  }
+
+  // 某家的出牌画像：出过什么牌型、哪些点数出得多（推断其手中所剩）、过牌情况
+  summarize(seat) {
+    const shapes = {};        // 牌型 -> 次数
+    const ranksPlayed = {};   // 点数 -> 张数
+    let lastPassedOn = null;
+    for (const p of this.plays) {
+      if (p.seat !== seat) continue;
+      if (p.cards) {
+        shapes[p.shape] = (shapes[p.shape] || 0) + 1;
+        for (const c of p.cards) ranksPlayed[c.rank] = (ranksPlayed[c.rank] || 0) + 1;
+      } else if (p.passedOn) {
+        lastPassedOn = p.passedOn;
+      }
+    }
+    return { shapes, ranksPlayed, lastPassedOn, passCount: this.passCount[seat] || 0 };
   }
 
   syncFinish(finishOrder) { this.finishOrder = finishOrder.slice(); }
@@ -394,6 +411,34 @@ export function describeTable(round, seat, tracker, strengths) {
       if (tracker.passCount[s] >= 3) sig.push(`${rel(s) === 2 ? '对家' : rel(s) === 1 ? '下家' : '上家'}已过${tracker.passCount[s]}次(牌力弱或压不动)`);
     }
     if (sig.length) lines.push('信号：' + sig.join('；'));
+  }
+
+  // 各家出牌画像（推断队友/对手手里可能有什么）
+  if (tracker && tracker.plays.length) {
+    const SHAPE_CN = { single: '单', pair: '对', triple: '三张', triple_pair: '三带二', straight: '顺子', pair_straight: '三连对', triple_straight: '钢板', bomb: '炸', straight_flush: '同花顺', kings: '天王' };
+    const RANK_CN = r => (r === 'BJ' ? '大王' : r === 'SJ' ? '小王' : r);
+    lines.push('各家出牌画像（据此推断他们手里还剩什么）：');
+    for (let s = 0; s < 4; s++) {
+      if (s === seat) continue;
+      const sum = tracker.summarize(s);
+      const tag = rel(s) === 2 ? '对家(队友)' : rel(s) === 1 ? '下家(对手)' : '上家(对手)';
+      const shapeStr = Object.entries(sum.shapes).map(([k, v]) => `${SHAPE_CN[k] || k}×${v}`).join(' ');
+      // 出得多的点数（≥2张）→ 该点数手里可能不多；从未出过且外面还有 → 可能捏着
+      const heavy = Object.entries(sum.ranksPlayed).filter(([, n]) => n >= 3).map(([r, n]) => `${RANK_CN(r)}×${n}`);
+      const neverPlayed = [];
+      if (remaining) {
+        for (const rk of ['BJ', 'SJ', level, 'A', 'K', 'Q']) {
+          if (!sum.ranksPlayed[rk] && remaining[rk] > 0) neverPlayed.push(RANK_CN(rk) === rk ? (rk === level ? `级牌${rk}` : rk) : RANK_CN(rk));
+        }
+      }
+      const parts = [`${tag}${s}`];
+      if (shapeStr) parts.push(`出过[${shapeStr}]`);
+      if (heavy.length) parts.push(`密集出过:${heavy.join(' ')}(这些点手里估计不多)`);
+      if (neverPlayed.length) parts.push(`从未出过:${neverPlayed.slice(0, 5).join('/')}且外面还有→可能捏着`);
+      if (sum.lastPassedOn) parts.push(`最近一次过牌是压不过【${SHAPE_CN[sum.lastPassedOn.shape] || sum.lastPassedOn.shape}${sum.lastPassedOn.value ? '值' + sum.lastPassedOn.value : ''}】`);
+      if (sum.passCount >= 2) parts.push(`已过${sum.passCount}次`);
+      lines.push('  ' + parts.join('；'));
+    }
   }
   return lines.join('\n');
 }

@@ -39,11 +39,13 @@ function buildCtx(round, seat, best = null) {
   };
 }
 
-test('SYSTEM_PROMPT 覆盖关键规则与团队/拖牌要求', () => {
-  for (const kw of ['拖', '双上', '末游', '逢人配', '接风', '队友', 'JSON']) {
+test('SYSTEM_PROMPT 覆盖关键规则与团队/拖牌/结构/残局要求', () => {
+  for (const kw of ['拖', '双上', '末游', '逢人配', '接风', '队友', 'JSON',
+    '手数', '拆', '控制张', '残局', '送队友', '绝对控制']) {
     assert.ok(SYSTEM_PROMPT.includes(kw), 'system prompt 应包含: ' + kw);
   }
-  assert.ok(SYSTEM_PROMPT.length < 3000, 'prompt 应精简(' + SYSTEM_PROMPT.length + '字符)');
+  // 有意扩充了决策规则（结构保护/残局/送队友），上限放宽到6000字符防无意义膨胀
+  assert.ok(SYSTEM_PROMPT.length < 6000, 'prompt 过长(' + SYSTEM_PROMPT.length + '字符)');
 });
 
 test('启发式：领出必出牌，且首攻不出纯拖', () => {

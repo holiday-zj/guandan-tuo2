@@ -6,7 +6,7 @@
 import { bestInterpretation, canBeat, beatScore } from '../classify.js';
 import { leadOptions, followOptions } from '../hint.js';
 import { orderValue, isWild, isJoker, tugRank, tugValueOf, cardLabel } from '../cards.js';
-import { handStrength, tugPolicy, teamSituation, describeTable, PlayTracker } from './analyze.js';
+import { handStrength, tugPolicy, teamSituation, describeTable, PlayTracker, decompose } from './analyze.js';
 import { askJson } from './llm.js';
 
 export const SYSTEM_PROMPT = `你是掼蛋（安徽拖2）顶级高手AI。你与对家是一队，目标是让你们队拿高分。
@@ -21,17 +21,32 @@ export const SYSTEM_PROMPT = `你是掼蛋（安徽拖2）顶级高手AI。你�
 - 红桃级牌=逢人配，可配除大小王外任意牌；天王(4王)>6张炸>同花顺>5张炸>普通牌型
 - 顺子只到A为止(A可作1用于A2345)，不绕回2
 
-# 你的决策原则（按优先级）
-1. 【团队观念】对家(队友)出的牌，只要没人能威胁，不要压队友！让队友走牌。对手出的牌才考虑压制
-2. 【拖牌时机】根据局势判断拖牌是"留"还是"甩"：
-   - 我方有望头游/二游 → 把拖牌留到最后一手打出(纯拖计分，红拖翻倍，头游纯拖还锁牌)
-   - 我方牌力弱恐成末游 → 拖牌尽早甩出去(夹在顺子/三带二里出掉也算甩)，闷在手里=给对方送分
-3. 【算牌】根据已出的牌推断外面剩什么：某点数外面已绝迹而你手里有 → 你是绝对控制，可放心先出小牌
-4. 【手数管理】牌力强的目标是抢先出完；出牌优先消耗"手数"，别拆炸弹/同花顺(它们是压制对手的武器)
-5. 【压制时机】对手只剩1-3张牌时必须全力压制(上炸弹也要压)，防止对手头游/双上
-6. 【接风】你出完牌后若最后一手没人要，牌权给对家；队友剩牌少时帮他清路
-7. 领出时：优先出"手数"里最难处理的散牌(小单张/小对子)，保留大牌型做后手控制
-8. 跟牌时：能小压不小压大，除非必须(压制对手关键点或送队友)；炸弹留给关键时刻
+# 决策前必做的推演（最重要！）
+每个候选都标了"⟶出后"，说明出这手牌后你剩余手牌的结构变化。选牌前，先在脑中把候选打出去，看剩下的牌还好不好走：
+1. **手数优先**：出完后"手数"(把手牌全部打完需要的最少次数)越少越好。同样能应对当前牌圈时，永远选手数减少或不变、且不带⚠的那个。
+2. **绝不无谓拆牌**：手里有对子/三张/炸弹时，若某候选标了"⚠拆散[对2张用1]"这类警告，说明它把成型牌拆散了，会让剩下的牌变零散难走——除非有明确战术理由(残局冲刺/送队友)，否则不选拆牌候选。
+   - 典型错误：手里有"三个3"，候选里既有"单个3"又有"三个3整出"，无脑选单个3会把三张拆成2张散牌，手数不降反升。应优先整组出，或干脆留着当控制。
+3. **控制张是武器不是消耗品**：炸弹/同花顺/天王/大王标了"⚠消耗控制张"的，只有在压制告急对手、抢头游、或残局清牌时才动用。中前盘为压一手普通牌就上炸=亏。
+4. **逢人配(红桃级牌)极珍贵**：能配任意牌补成炸弹/同花顺/钢板。除非能一举奠定胜局，否则不要单独当小牌打掉。
+
+# 团队与算牌
+5. 【团队观念】队友(对家)出的牌默认不压，让他走。只有"你要冲头游"或"队友明显走不动需要你接风"时才压队友。
+6. 【推断队友手牌】看"各家出牌画像"：队友密集出过的点数他手里估计不多了；队友从没出过、而外面还有的大点数(如A/王/级牌)他可能捏着当后手。若判断队友能压住当前对手、或队友快走完了，你就过牌让路、或用大牌帮他清障。
+7. 【送队友】当队友只剩很少牌(尤其≤3张)且这手牌权能交到他手上时，优先出他压得住的小牌把牌权送给他，让他先走成头游/二游。
+8. 【算牌绝对控制】某点数外面已全部出光而你手里有→你是该点数的绝对控制，可放心先甩别的小牌，把它留作后手稳赢一手。
+
+# 残局（关键！最后关头别送对手）
+9. 对手只剩1~3张牌时：这是最高优先级。必须全力压制，能压就压(哪怕动用炸弹/天王)，绝不能让对手轻松走掉拿头游或凑成双上。此时"别浪费控制张"的原则让位于"拦住对手"。
+10. 对手牌少且当前是他领出小牌时，警惕他在"清最后一手"，你有大牌就顶上。
+11. 反过来，我方(你或队友)只剩很少牌时，目标是抢先出完：能一次清完就清完；最后一手尽量是纯拖牌(计分+头游锁牌)。
+
+# 拖牌时机
+12. 我方有望头游/二游 → 拖牌留到最后一手打纯拖(计分翻倍+头游锁牌)；此时别把拖牌夹在小牌里早早出掉。
+13. 我方牌力弱恐成末游 → 拖牌尽早甩出去(夹在顺子/三带二里出掉也算)，闷在手里=当末游给对方送分。
+
+# 出牌方式细节
+14. 领出：优先出最难处理的散牌(小单张/小对子)，把大牌型和成型牌留作后手控制；但同样要看出后手数，别为出散牌反而拆了成型牌。
+15. 跟牌：能小压不用大压，省着大牌；压不住且不必要时宁可过牌保留实力。
 
 # 输出格式（严格JSON，不要其他文字）
 {"action":"play","candidate":<候选编号>,"reason":"<20字内理由>"}
@@ -62,8 +77,7 @@ function buildCandidates(hand, level, best, opts = {}) {
   return uniq;
 }
 
-function candidateLabel(c, level, tug) {
-  const n = c.cards.length;
+function candidateLabel(c, level, tug, after) {
   const typeCn = {
     single: '单', pair: '对', triple: '三张', triple_pair: '三带二', straight: '顺子',
     pair_straight: '三连对', triple_straight: '钢板', bomb: '炸弹', straight_flush: '同花顺', kings: '天王',
@@ -71,7 +85,46 @@ function candidateLabel(c, level, tug) {
   const pureTug = c.cards.every(x => x.rank === tug) ? '【纯拖!】' : '';
   const hasTug = c.cards.some(x => x.rank === tug) ? '(含拖)' : '';
   const hasWild = c.cards.some(x => isWild(x, level)) ? '(配)' : '';
-  return `${c.idx}. ${typeCn} ${c.cards.map(cardLabel).join(' ')}${pureTug}${hasTug}${hasWild}`;
+  let afterStr = '';
+  if (after) {
+    // 结构变化：手数增减 + 拆掉了哪些成型牌 + 控制张是否被消耗
+    const bits = [];
+    const dh = after.hands - after.baseHands;
+    if (dh < 0) bits.push(`手数${after.baseHands}→${after.hands}(减${-dh})`);
+    else if (dh > 0) bits.push(`手数${after.baseHands}→${after.hands}(增${dh}!)`);
+    else bits.push(`手数不变(${after.hands})`);
+    if (after.breaks.length) bits.push('⚠拆散[' + after.breaks.join(',') + ']');
+    if (after.lostControls.length) bits.push('⚠消耗控制张[' + after.lostControls.join(',') + ']');
+    afterStr = ' ⟶出后: ' + bits.join(' ');
+  }
+  return `${c.idx}. ${typeCn} ${c.cards.map(cardLabel).join(' ')}${pureTug}${hasTug}${hasWild}${afterStr}`;
+}
+
+// 预计算每个候选"出牌后"的手牌结构（相对基线的变化）
+function annotateCandidates(candidates, hand, level, strength) {
+  const base = strength.decompose;
+  const baseHands = strength.hands;
+  // 基线里的成型牌（对子及以上）：出牌把它们拆散 = 破坏结构
+  const baseCombos = base.combos.filter(c => c.cards.length >= 2);
+  for (const cand of candidates) {
+    const ids = new Set(cand.cards.map(x => x.id));
+    const rest = hand.filter(c => !ids.has(c.id));
+    if (!rest.length) { cand.after = { hands: 0, baseHands, breaks: [], lostControls: [] }; continue; }
+    const d2 = decompose(rest, level);
+    const breaks = [];
+    for (const combo of baseCombos) {
+      const used = combo.cards.filter(c => ids.has(c.id)).length;
+      if (used > 0 && used < combo.cards.length) breaks.push(combo.type + combo.cards.length + '张用' + used);
+      else if (used === combo.cards.length && combo.cards.length >= 3) breaks.push('整组' + combo.type);
+    }
+    const lostControls = [];
+    for (const ctrl of base.controls) {
+      const used = ctrl.cards.filter(c => ids.has(c.id)).length;
+      if (used > 0) lostControls.push(used === ctrl.cards.length ? ctrl.type + '(整用)' : ctrl.type + `(拆${used}/${ctrl.cards.length})`);
+    }
+    cand.after = { hands: d2.hands, baseHands, breaks: [...new Set(breaks)], lostControls: [...new Set(lostControls)] };
+  }
+  return candidates;
 }
 
 // ————— 启发式决策（LLM 降级保底，也用于压测）————
@@ -217,24 +270,41 @@ export async function llmDecide(ctx, opts = {}) {
 
   // 组装 prompt
   const table = describeTable(round, seat, tracker, ctx.strengths);
-  const candLines = candidates.map(c => candidateLabel(c, level, tug)).join('\n');
+  // 为每个候选标注"出牌后"的结构变化（手数增减/拆牌警告/控制张消耗）——核心防拆牌信息
+  annotateCandidates(candidates, hand, level, strength);
+  const candLines = candidates.map(c => candidateLabel(c, level, tug, c.after)).join('\n');
   const trickInfo = best
-    ? `当前牌圈：${best.by === (seat + 2) % 4 ? '队友' : '对手'}(${best.by}号位)出了【${best.cards.map(cardLabel).join(' ')}】(${best.it.type})，你是第${ctx.turnN || '?'}个应对`
+    ? `当前牌圈：${best.by === (seat + 2) % 4 ? '队友' : '对手'}(${best.by}号位)出了【${best.cards.map(cardLabel).join(' ')}】(${best.it.type})`
     : `轮到你【领出】(你是本圈第一个出牌)`;
-  const partnerName = best && best.by === (seat + 2) % 4 ? '（这是队友的牌！）' : '';
+  const partnerName = best && best.by === (seat + 2) % 4 ? '（这是队友的牌！默认不压，除非能帮队友或你要冲牌）' : '';
+
+  // 残局警报：任何人剩牌≤5张都单独强调
+  const endgame = [];
+  const hc = tracker ? tracker.handCounts() : round.hands.map(h => (h ? h.length : 0));
+  for (let s = 0; s < 4; s++) {
+    if (s === seat || round.finishOrder.includes(s)) continue;
+    const rel = ((s - seat + 4) % 4);
+    const who = rel === 2 ? '队友' : rel === 1 ? '下家(对手)' : '上家(对手)';
+    if (hc[s] <= 5) endgame.push(`🚨${who}${s}只剩${hc[s]}张！${who === '队友' ? '考虑送牌帮他先走' : '他随时可能走掉，压制优先级最高'}`);
+  }
+  const endgameStr = endgame.length ? endgame.join('\n') : '';
+
+  // 对局记忆：早期回顾(已压缩) + 最近出牌流水 + 我自己此前的计划
+  const memoryStr = ctx.memory ? ctx.memory.buildFor(seat) : '';
 
   const user = `${table}
 
+${memoryStr ? memoryStr + '\n\n' : ''}${endgameStr}
 ${trickInfo}${partnerName}
 
 我的拖牌策略：${policy.policy}（${policy.reason}）
-我的手牌(${hand.length}张)：${hand.slice().sort((a, b) => orderValue(a.rank, level) - orderValue(b.rank, level)).map(cardLabel).join(' ')}
+我的手牌(${hand.length}张，手数≈${strength.hands})：${hand.slice().sort((a, b) => orderValue(a.rank, level) - orderValue(b.rank, level)).map(cardLabel).join(' ')}
 
-合法候选（只能从中选，编号即答案）：
+合法候选（只能从中选，编号即答案；⟶出后 是该选择对剩余手牌结构的影响）：
 ${candLines}
 ${best ? '（也可以选择 pass 过牌）' : '（领出必须出牌，不能pass）'}
 
-请决策，输出JSON。`;
+请先评估各候选出后剩余结构（手数最少、不拆成型牌、不浪费控制张者优先），结合各家画像与我此前的计划决定，输出JSON。`;
 
   const r = await askJson(SYSTEM_PROMPT, user, {
     fast: opts.fast,
@@ -321,7 +391,16 @@ export async function decideAsync(session, seat, trackerMap, opts = {}) {
   const ctx = {
     hand, level, tug, best, candidates: legal, strength, strengths,
     policy, situation, seat, round, tracker,
+    memory: session.memory || null,
     isFirstLead: !round.led,
+  };
+
+  // 决策后把自己的判断记入记忆（计划连续性，供后续决策参考）
+  const rememberPlan = (action) => {
+    if (session.memory && action && action.reason) {
+      session.memory.addPlan(seat, action.reason);
+    }
+    return action;
   };
 
   // LLM 主决策（失败自动降级启发式，永不阻塞游戏）
@@ -334,11 +413,11 @@ export async function decideAsync(session, seat, trackerMap, opts = {}) {
       new Promise(resolve => setTimeout(() => resolve(null), HARD_TIMEOUT)),
     ]);
     if (!action) {
-      return { ...heuristicDecide(ctx), via: 'hard-timeout-fallback' };
+      return rememberPlan({ ...heuristicDecide(ctx), via: 'hard-timeout-fallback' });
     }
     action.llm = true;
-    return action;
+    return rememberPlan(action);
   } catch (e) {
-    return { ...heuristicDecide(ctx), via: 'exception-fallback', error: String(e.message || e) };
+    return rememberPlan({ ...heuristicDecide(ctx), via: 'exception-fallback', error: String(e.message || e) });
   }
 }

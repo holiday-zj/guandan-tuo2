@@ -3,9 +3,16 @@ import crypto from 'node:crypto';
 import { Match } from '../engine/match.js';
 import { cardLabel, orderValue } from '../engine/cards.js';
 import { PlayTracker } from '../engine/ai/analyze.js';
+import { RoundMemory } from '../engine/ai/memory.js';
 import { botDecide, botDecideAsync } from './bot.js';
 
 let roomSeq = 100;
+
+// 牌型中文名（记忆日志用）
+const SHAPE_CN = {
+  single: '单', pair: '对', triple: '三张', triple_pair: '三带二', straight: '顺子',
+  pair_straight: '三连对', triple_straight: '钢板', bomb: '炸弹', straight_flush: '同花顺', kings: '天王',
+};
 
 // —— 房间 ——
 export class Room {
@@ -112,6 +119,7 @@ export class GameSession {
     this.turnStartedAt = Date.now();
     this._finishNotified = new Set(); // 已发过 finish 事件的座位（含自动判定的名次）
     this.trackers = null;             // 每座位一个 PlayTracker（AI算牌用，只记公开信息）
+    this.memory = null;               // 本副牌的对局记忆（AI上下文保留+自动压缩）
   }
 
   seatNames() {
@@ -158,6 +166,8 @@ export class GameSession {
     // AI 算牌追踪器：每个座位一份，只记录公开信息（谁出了什么/过牌几次）
     this.trackers = [new PlayTracker(), new PlayTracker(), new PlayTracker(), new PlayTracker()];
     for (const t of this.trackers) t.reset(round.level, round.tug);
+    // 新一副 → 全新记忆（每副独立亮牌定级定队，跨副记忆无意义）
+    this.memory = new RoundMemory(this.roundNum, round.level, round.tug);
     this._finishNotified = new Set();
     return info;
   }
@@ -191,7 +201,12 @@ export class GameSession {
       if (!d.best) return { ok: false, error: '领出不能过' };
       d.consecutivePasses++;
       this.lastPlays[seat] = { pass: true };
-      if (this.trackers) for (const t of this.trackers) t.record(seat, null, 'pass');
+      if (this.trackers) for (const t of this.trackers) t.record(seat, null, 'pass', d.best && d.best.it ? { shape: d.best.it.type, value: d.best.it.value } : null);
+      if (this.memory) {
+        const on = d.best && d.best.it ? `压不过${SHAPE_CN[d.best.it.type] || d.best.it.type}(值${d.best.it.value})` : '过';
+        this.memory.addPlay(seat, '过牌，' + on);
+        this.memory.maybeCompress();
+      }
       events.push({ type: 'pass', seat });
       const needPasses = this.activeCount() - (this.active(d.best.by) ? 1 : 0);
       if (d.consecutivePasses >= needPasses) {
@@ -219,6 +234,20 @@ export class GameSession {
     if (this.trackers) {
       const pub = cards.map(c => ({ id: c.id, suit: c.suit, rank: c.rank }));
       for (const t of this.trackers) t.record(seat, pub, ev.play.type);
+    }
+    // 写入对局记忆：出牌流水 + 关键事件标记（炸弹/同花顺/天王/纯拖/出完）
+    if (this.memory) {
+      const shapeName = SHAPE_CN[ev.play.type] || ev.play.type;
+      const pureTug = cards.every(c => c.rank === r.tug);
+      const labels = cards.map(cardLabel).join(' ');
+      const notable = ['bomb', 'straight_flush', 'kings'].includes(ev.play.type)
+        || pureTug || r.hands[seat].length === 0;
+      let text = `出${shapeName}[${labels}]，剩${r.hands[seat].length}张`;
+      if (pureTug) text += '【纯拖牌!】';
+      if (r.hands[seat].length === 0) text += `【出完，第${r.finishOrder.length}名】`;
+      if (ev.tugLocked) text += '【头游纯拖锁牌，强制接风队友】';
+      this.memory.addPlay(seat, text, notable);
+      this.memory.maybeCompress();
     }
     this.turnStartedAt = Date.now();
     events.push({
