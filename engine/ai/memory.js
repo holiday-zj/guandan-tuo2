@@ -68,7 +68,7 @@ export class RoundMemory {
 
     const myPlans = this.plans[seat].slice(-KEEP_PLANS);
     if (myPlans.length) {
-      parts.push('【我此前的判断与计划(保持连续性，别自相矛盾)】\n'
+      parts.push('【我此前几手的判断(仅供了解我留了什么牌，局势变了就按当前局面决策，不要死守旧计划)】\n'
         + myPlans.map(p => `#${p.n} ${p.text}`).join('\n'));
     }
 
