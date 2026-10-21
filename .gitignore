@@ -9,5 +9,6 @@ data/
 *.key
 .env
 data/llm.env
+data/llm-io.log
 
 .DS_Store

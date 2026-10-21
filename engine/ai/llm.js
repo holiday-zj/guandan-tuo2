@@ -54,6 +54,43 @@ function cacheKey(model, messages) {
   return h.digest('hex').slice(0, 32);
 }
 
+// —— 大模型输入输出日志（写入 data/llm-io.log；设 LLM_IO_LOG=0 可关闭）——
+const IO_LOG_FILE = path.resolve(__dirname, '../../data/llm-io.log');
+let ioSeq = 0;
+let sysPromptLogged = false;
+
+function logIO(reqId, model, type, payload) {
+  if (process.env.LLM_IO_LOG === '0') return;
+  try {
+    const ts = new Date().toISOString().slice(0, 19).replace('T', ' ');
+    const lines = [`[${ts}] #${reqId} ${type} model=${model}`];
+    if (type === 'REQUEST') {
+      // system prompt 每次相同，只在进程内完整记录一次
+      if (!sysPromptLogged) {
+        lines.push('===== SYSTEM PROMPT（完整，后续请求省略）=====');
+        lines.push(payload.system);
+        sysPromptLogged = true;
+      } else {
+        lines.push('===== SYSTEM PROMPT: 同前，省略 =====');
+      }
+      lines.push('===== USER PROMPT（发给模型的牌局信息）=====');
+      lines.push(payload.user);
+    } else if (type === 'RESPONSE') {
+      lines.push(`===== 耗时 ${payload.ms}ms =====`);
+      lines.push('----- RAW（模型原始输出）-----');
+      lines.push(String(payload.raw || '').trim());
+      lines.push('----- PARSED（解析后实际执行）-----');
+      lines.push(JSON.stringify(payload.parsed));
+      if (payload.usage) lines.push('----- TOKENS ----- ' + JSON.stringify(payload.usage));
+    } else if (type === 'ERROR') {
+      lines.push(`===== 调用失败 耗时${payload.ms}ms =====`);
+      lines.push(String(payload.error));
+    }
+    lines.push('');
+    fs.appendFileSync(IO_LOG_FILE, lines.join('\n') + '\n');
+  } catch { /* 日志失败绝不能影响游戏 */ }
+}
+
 /**
  * 调用大模型，要求返回 JSON
  * @returns {Promise<{ok:boolean, data?:any, raw?:string, ms:number, cached?:boolean, error?:string}>}
@@ -70,8 +107,10 @@ export async function askJson(systemPrompt, userPrompt, opts = {}) {
   const ck = cacheKey(model, messages);
   if (cache.has(ck)) return { ok: true, data: cache.get(ck), cached: true, ms: 0 };
 
+  const reqId = (++ioSeq).toString(36);
   const timeoutMs = opts.timeoutMs || 12000;
   const t0 = Date.now();
+  logIO(reqId, model, 'REQUEST', { system: systemPrompt, user: userPrompt });
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   try {
@@ -95,6 +134,7 @@ export async function askJson(systemPrompt, userPrompt, opts = {}) {
     });
     if (!resp.ok) {
       const txt = (await resp.text()).slice(0, 200);
+      logIO(reqId, model, 'ERROR', { ms: Date.now() - t0, error: `HTTP ${resp.status}: ${txt}` });
       return { ok: false, ms: Date.now() - t0, error: `HTTP ${resp.status}: ${txt}` };
     }
     // ⚠️ 关键：abort 定时器必须覆盖到响应体读取完成。
@@ -104,13 +144,16 @@ export async function askJson(systemPrompt, userPrompt, opts = {}) {
     clearTimeout(timer);
     const raw = d?.choices?.[0]?.message?.content || '';
     const data = extractJson(raw);
+    logIO(reqId, model, 'RESPONSE', { ms: Date.now() - t0, raw, parsed: data, usage: d?.usage });
     if (!data) return { ok: false, ms: Date.now() - t0, raw, error: 'JSON_PARSE_FAILED' };
     if (cache.size >= CACHE_MAX) cache.delete(cache.keys().next().value);
     cache.set(ck, data);
     return { ok: true, data, raw, ms: Date.now() - t0, usage: d.usage };
   } catch (e) {
     clearTimeout(timer);
-    return { ok: false, ms: Date.now() - t0, error: e.name === 'AbortError' ? 'TIMEOUT' : String(e.message || e) };
+    const err = e.name === 'AbortError' ? 'TIMEOUT' : String(e.message || e);
+    logIO(reqId, model, 'ERROR', { ms: Date.now() - t0, error: err });
+    return { ok: false, ms: Date.now() - t0, error: err };
   }
 }
 
