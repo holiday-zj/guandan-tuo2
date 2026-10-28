@@ -160,6 +160,7 @@ export class GameSession {
       consecutivePasses: 0,
       turn: lead,
       trickSeq: 0,              // 本圈是第几手（供AI判断局势）
+      streakInfo: { lastWinner: -1, winStreak: 0 }, // 连续拿牌权追踪（守门/追赶规则用）
     };
     this.lastPlays = {};
     this.turnStartedAt = Date.now();
@@ -300,6 +301,12 @@ export class GameSession {
       events.push(...this.finishRound());
       return events;
     }
+    // 连续拿牌权计数：同一人连续赢圈 → 守门方(上家)/追赶方(下家)要压牌
+    const prev = d.streakInfo || { lastWinner: -1, winStreak: 0 };
+    d.streakInfo = {
+      lastWinner: next,
+      winStreak: next === prev.lastWinner ? prev.winStreak + 1 : 1,
+    };
     d.best = null;
     d.consecutivePasses = 0;
     d.turn = next;

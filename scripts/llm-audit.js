@@ -45,7 +45,8 @@ for (const b of blocks) {
 }
 
 const V = ['V1_pass_on_lead', 'V2_pass_opp_urgent', 'V3_jiefeng_misread', 'V4_beat_partner',
-  'V5_pick_warned', 'V6_pick_hands_up', 'V7_pass_partner_urgent', 'V8_ignore_recommend'];
+  'V5_pick_warned', 'V6_pick_hands_up', 'V7_pass_partner_urgent', 'V8_ignore_recommend',
+  'V9_gate_pass', 'V10_solebomb_misuse'];
 const S = {
   total: 0, errors: 0, parseFail: 0, ok: 0, pass: 0, play: 0,
   corrected: 0, overridden: 0, engineFallback: 0, llmClean: 0,
@@ -126,6 +127,11 @@ for (const rid of order) {
     } else if (/接风/.test(d.reason || '') && A.passWindsToOpp === true) {
       bump('V3_jiefeng_misread');
     }
+    // 守门/追赶警报下过牌（新架构AUDIT才有mustGate/mustChase；有干净候选才算违规，这里从简：有警报+过牌即观察）
+    if (!A.isLead && A.byPartner === false && (A.mustGate || A.mustChase)) {
+      const hasClean = [...cands.values()].some(x => !x.line.includes('⚠'));
+      if (hasClean) bump('V9_gate_pass');
+    }
   } else if (d.action === 'play') {
     S.play++;
     const c = cands.get(d.candidate);
@@ -150,6 +156,11 @@ for (const rid of order) {
     } else if (A.recAction === 'pass') {
       S.V8_ignore_recommend++;
     }
+    // 唯一炸弹误用（新架构）：soleBomb=true 且无告急/对手未≤2手，却打出炸类
+    if (A.soleBomb === true && !A.oppNearDone && !A.canWinAll) {
+      const cl = line || '';
+      if (/炸弹|同花顺|天王/.test(cl)) bump('V10_solebomb_misuse');
+    }
   }
 }
 
@@ -169,6 +180,10 @@ const report = {
   violations: Object.fromEntries(V.map(k => [k, `${S[k]} (${pct(S[k], decisions)})` + (S[k + '@new'] ? ` [新架构${S[k + '@new']}/旧${S[k + '@legacy'] || 0}]` : '')])),
   hardViolationTotal: `${hardTotal} (${pct(hardTotal, decisions)})`,
   hardViolationNewArchOnly: V.slice(0, 7).reduce((a, k) => a + (S[k + '@new'] || 0), 0),
+  observed: {
+    V9_gate_pass: S.V9_gate_pass,
+    V10_solebomb_misuse: S.V10_solebomb_misuse,
+  },
   latencyMs: lat.length ? { p50: lat[lat.length >> 1], p90: lat[Math.floor(lat.length * .9)], p99: lat[Math.floor(lat.length * .99)], max: lat[lat.length - 1] } : null,
 };
 

@@ -27,10 +27,12 @@ export const SYSTEM_PROMPT = `你是掼蛋（安徽拖2）顶级高手AI。你�
 2. 残局警报：🚨牌圈主/对手告急(剩牌≤3张) → 必须压制，不惜炸弹天王。压不住才过。
 3. 残局警报：🚨队友剩1~2张且牌权在对手手上 → 必须夺牌权再送队友小牌(送队友走是残局第一要务)。注意：过牌≠接风给他，他拿不到牌权！
 4. 队友的牌(队友正握牌权、未出完) → 默认过牌让他走。尤其队友只剩1张时坚决过牌：对手压不过他这手，他下一手直接走掉拿头游。引擎给出的"对手要得起概率"低 → 更没必要接；只有队友快出完且对手很可能压他时，你才考虑接过来改送小牌保他。
-5. 🚧拦截窗口(对手估计≤3手牌)：在不破坏自己结构(手数不增、不拆成型牌)的前提下去接，打乱对手节奏；接牌要拆牌/耗炸则放过。
-6. 常规跟牌对手 → 从引擎推荐[★]开始考虑：能小压不大压；要用A/级牌/炸去压小牌且无任何警报 → 过牌保留实力。
-7. 领出 → 出结构无损的小散牌(手数减少的成型牌优先)，控制张和逢人配留作后手；拖牌按【策略】处理。
-8. 算牌：某点数外面已出光而你手里有 = 绝对控制，可放心先甩小牌把它留作稳赢后手。
+5. 防守警报：🛡守门(对手连续拿牌权>1次，你是他上家) → 务必尽量压，用结构无损的牌也压；🏃追赶(连续>2次，你是他下家) → 能压就压。不能让同一对手走得太轻松。
+6. 🚧拦截窗口(对手估计≤3手牌)：在不破坏自己结构(手数不增、不拆成型牌)的前提下去接，打乱对手节奏；接牌要拆牌/耗炸则放过。
+7. 常规跟牌对手：不破坏自己结构、或破坏后手数不增能重组好 → 正常压牌(小压优先)；要拆成型牌/手数增加 → 一般不压。要用A/级牌/炸去压小牌且无任何警报 → 过牌保留实力。
+8. 💣唯一炸弹纪律：你手里只剩一手炸(含同花顺，同花顺含红桃级牌可配的)时留到最后，一般在对手估计只剩≤2手牌时才用它炸；末手纯拖炸锁牌除外。
+9. 领出 → 出结构无损的小散牌(手数减少的成型牌优先)，控制张和逢人配留作后手；拖牌按【策略】处理。
+10. 算牌：某点数外面已出光而你手里有 = 绝对控制，可放心先甩小牌把它留作稳赢后手。
 
 # 候选使用规则（重要）
 - 候选已按引擎评分从高到低排列，#0标[★引擎推荐]。无明确战术理由不要偏离推荐。
@@ -253,6 +255,10 @@ ${best ? '（也可以 pass 过牌，过牌后果见【过牌后果】）' : '�
       passWindsToOpp: !!facts.passWindsToOpp, passNextIsPartner: !!facts.passNextIsPartner,
       canWinAll: !!facts.canWinAll, winAllIdx: facts.winAllIdx,
       handCount: hand.length, myHands: strength.hands,
+      mustGate: !!facts.mustGate, mustChase: !!facts.mustChase,
+      streakOpp: facts.streakOpp, streakCount: facts.streakCount,
+      soleBomb: !!facts.soleBomb, oppNearDone: !!facts.oppNearDone,
+      oppEndgame: !!facts.oppEndgame, oppHandsEst: facts.oppHandsEst,
       recAction: recommend.action, recIdx: recommend.idx ?? null,
       passScore: best ? passScore(ctx, facts) : null,
       candScores: candidates.map(c => [c.idx, c.score]),

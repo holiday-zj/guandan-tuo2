@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Round } from '../engine/game.js';
 import { PlayTracker, handStrength, tugPolicy } from '../engine/ai/analyze.js';
-import { buildFacts, factsToText, prepareDecision, validateDecision, engineRecommend, scoreCandidate, passScore, estimateOppBeatRisk, estimateHands } from '../engine/ai/score.js';
+import { buildFacts, factsToText, prepareDecision, validateDecision, engineRecommend, scoreCandidate, passScore, estimateOppBeatRisk, estimateHands, bombHandsCount } from '../engine/ai/score.js';
 import { RoundMemory } from '../engine/ai/memory.js';
 import { bestInterpretation } from '../engine/classify.js';
 import { leadOptions, followOptions } from '../engine/hint.js';
@@ -338,4 +338,137 @@ test('记忆压缩：全零段不再生成垃圾摘要行', () => {
     assert.ok(!/座0出0手\/过0次；座1出0手\/过0次；座2出0手\/过0次；座3出0手\/过0次/.test(m.summary), '不应出现全零摘要行');
   }
   assert.ok(true);
+});
+
+/* ===== 用户规则：守门/追赶 + 唯一炸弹纪律 ===== */
+
+test('守门：对手连赢1圈后又出牌，我是他上家 → mustGate=true，推荐压牌', () => {
+  const myHand = [C('6', '♠', 1), C('7', '♥', 2), C('8', '♣', 3), C('4', '♦', 4),
+    C('A', '♠', 5), C('K', '♥', 6), C('Q', '♣', 7), C('5', '♦', 8), C('3', '♠', 9), C('J', '♥', 10)];
+  const round = makeRound('9', [myHand, [C('3', '♠', 90)], [C('4', '♠', 91)], [C('6', '♠', 92)]]);
+  const t = [C('5', '♠', 60)]; // 对手座1(我=座0是他的上家)出单5
+  const best = { cards: t, it: bestInterpretation(t, '9'), by: 1 };
+  const driver = { best, consecutivePasses: 0, turn: 0, trickSeq: 2, streakInfo: { lastWinner: 1, winStreak: 1 } };
+  const ctx = buildCtx(round, 0, best, driver);
+  ctx.tracker.playedBySeat[1] = 10; // 对手剩17张，不告急
+  const { facts, recommend } = prepareDecision(ctx);
+  assert.equal(facts.streakOpp, 1);
+  assert.equal(facts.streakCount, 1);
+  assert.equal(facts.mustGate, true, '我是连赢对手的上家应触发守门');
+  assert.equal(facts.mustChase, false);
+  assert.equal(recommend.action, 'play', '守门务必压牌');
+  assert.equal(recommend.hard, 'gate');
+  assert.match(factsToText(facts, 0), /守门警报/);
+});
+
+test('追赶：对手连赢2圈后又出牌(>2次)，我是他下家 → mustChase=true', () => {
+  const myHand = [C('6', '♠', 1), C('7', '♥', 2), C('8', '♣', 3), C('4', '♦', 4),
+    C('A', '♠', 5), C('K', '♥', 6), C('Q', '♣', 7), C('5', '♦', 8), C('3', '♠', 9), C('J', '♥', 10)];
+  const round = makeRound('9', [myHand, [C('3', '♠', 90)], [C('4', '♠', 91)], [C('6', '♠', 92)]]);
+  const t = [C('5', '♠', 60)]; // 对手座3出牌；我=座0是他下家(3+1=0)
+  const best = { cards: t, it: bestInterpretation(t, '9'), by: 3 };
+  const driver = { best, consecutivePasses: 0, turn: 0, trickSeq: 2, streakInfo: { lastWinner: 3, winStreak: 2 } };
+  const ctx = buildCtx(round, 0, best, driver);
+  ctx.tracker.playedBySeat[3] = 10;
+  const { facts, recommend } = prepareDecision(ctx);
+  assert.equal(facts.mustChase, true, '连赢2圈+本圈出牌=第3次，下家应追赶');
+  assert.equal(facts.mustGate, false);
+  assert.equal(recommend.action, 'play', '追赶能压就压');
+  assert.equal(recommend.hard, 'chase');
+  assert.match(factsToText(facts, 0), /追赶警报/);
+});
+
+test('连赢对手是队友时 → 不触发守门/追赶(不给队友上强度)', () => {
+  const myHand = [C('6', '♠', 1), C('7', '♥', 2), C('8', '♣', 3), C('4', '♦', 4), C('3', '♠', 9)];
+  const round = makeRound('9', [myHand, [C('3', '♠', 90)], [C('4', '♠', 91)], [C('6', '♠', 92)]]);
+  const t = [C('5', '♠', 60)]; // 队友座2出牌
+  const best = { cards: t, it: bestInterpretation(t, '9'), by: 2 };
+  const driver = { best, consecutivePasses: 0, turn: 0, trickSeq: 2, streakInfo: { lastWinner: 2, winStreak: 2 } };
+  const ctx = buildCtx(round, 0, best, driver);
+  const { facts } = prepareDecision(ctx);
+  assert.equal(facts.mustGate, false);
+  assert.equal(facts.mustChase, false);
+});
+
+test('守门警报下LLM过牌(有结构无损候选) → 校验器要求压牌', () => {
+  const myHand = [C('6', '♠', 1), C('7', '♥', 2), C('8', '♣', 3), C('4', '♦', 4),
+    C('A', '♠', 5), C('K', '♥', 6), C('Q', '♣', 7), C('5', '♦', 8), C('3', '♠', 9), C('J', '♥', 10)];
+  const round = makeRound('9', [myHand, [C('3', '♠', 90)], [C('4', '♠', 91)], [C('6', '♠', 92)]]);
+  const t = [C('5', '♠', 60)];
+  const best = { cards: t, it: bestInterpretation(t, '9'), by: 1 };
+  const driver = { best, consecutivePasses: 0, turn: 0, trickSeq: 2, streakInfo: { lastWinner: 1, winStreak: 1 } };
+  const ctx = buildCtx(round, 0, best, driver);
+  ctx.tracker.playedBySeat[1] = 10;
+  const { facts } = prepareDecision(ctx);
+  const v = validateDecision({ action: 'pass', reason: '省牌' }, ctx, facts);
+  assert.ok(v, '守门时过牌应违规');
+  assert.match(v, /守门方/);
+});
+
+test('bombHandsCount：4炸=1手；3张+红桃级牌(逢人配)=1手潜在炸；同花4连+配=1手', () => {
+  // 普通4炸
+  {
+    const hand = [C('7', '♠', 1), C('7', '♥', 2), C('7', '♣', 3), C('7', '♦', 4), C('3', '♠', 5)];
+    const st = handStrength(hand, '9', null);
+    assert.equal(bombHandsCount(st, hand, '9'), 1, '4炸=1手');
+  }
+  // 3张7 + 红桃9(级牌9→逢人配)：可配成4炸
+  {
+    const hand = [C('7', '♠', 1), C('7', '♣', 2), C('7', '♦', 3), C('9', '♥', 4), C('3', '♠', 5)];
+    const st = handStrength(hand, '9', null);
+    assert.equal(bombHandsCount(st, hand, '9'), 1, '3张+红桃级牌应算1手潜在炸');
+  }
+  // 同花4连(♠5♠6♠7♠8) + 红桃级牌 → 同花顺
+  {
+    const hand = [C('5', '♠', 1), C('6', '♠', 2), C('7', '♠', 3), C('8', '♠', 4), C('9', '♥', 5), C('3', '♠', 6)];
+    const st = handStrength(hand, '9', null);
+    assert.equal(bombHandsCount(st, hand, '9'), 1, '同花4连+红桃级牌应算1手潜在同花顺');
+  }
+  // 无炸无配
+  {
+    const hand = [C('5', '♠', 1), C('6', '♥', 2), C('8', '♣', 3)];
+    const st = handStrength(hand, '9', null);
+    assert.equal(bombHandsCount(st, hand, '9'), 0);
+  }
+});
+
+test('唯一炸弹：无告急时不许动用(评分重罚+校验器拦截)；对手≤2手时可炸', () => {
+  const myHand = [C('7', '♠', 1), C('7', '♥', 2), C('7', '♣', 3), C('7', '♦', 4),
+    C('3', '♠', 5), C('4', '♦', 6), C('5', '♠', 7), C('8', '♥', 8)];
+  const round = makeRound('9', [myHand, [C('3', '♠', 90)], [C('4', '♠', 91)], [C('6', '♠', 92)]]);
+  const t = [C('5', '♠', 60)]; // 对手出单5，我有单8能压(结构无损)
+  const best = { cards: t, it: bestInterpretation(t, '9'), by: 1 };
+  const ctx = buildCtx(round, 0, best);
+  ctx.tracker.playedBySeat[1] = 10; // 对手剩17张
+  const { facts, recommend } = prepareDecision(ctx);
+  assert.equal(facts.soleBomb, true, '只有一手炸应识别soleBomb');
+  assert.equal(facts.oppNearDone, false);
+  assert.equal(recommend.action, 'play', '应压牌');
+  const recC = ctx.candidates.find(c => c.idx === recommend.idx);
+  assert.notEqual(recC.type, 'bomb', '唯一炸弹不该被推荐(用单8压)');
+  // 校验器：LLM动用唯一炸弹(无告急) → 违规
+  const bombCand = ctx.candidates.find(c => c.type === 'bomb');
+  assert.ok(bombCand, '候选里应有炸7');
+  const v = validateDecision({ action: 'play', candidate: bombCand.idx, reason: '炸他' }, ctx, facts);
+  assert.ok(v, '无告急动用唯一炸弹应违规');
+  assert.match(v, /留到最后/);
+
+  // 对手估计只剩2手(8张→2手)：soleBomb允许使用
+  const ctx2 = buildCtx(round, 0, best);
+  ctx2.tracker.playedBySeat[1] = 19; // 剩8张=2手
+  const f2 = prepareDecision(ctx2).facts;
+  assert.equal(f2.oppNearDone, true, '对手8张(≤2手)应触发oppNearDone');
+  const v2 = validateDecision({ action: 'play', candidate: ctx2.candidates.find(c => c.type === 'bomb').idx, reason: '炸他' }, ctx2, f2);
+  assert.equal(v2, null, '对手≤2手时唯一炸弹可用');
+});
+
+test('两手持炸时不受唯一炸弹纪律限制', () => {
+  const myHand = [C('7', '♠', 1), C('7', '♥', 2), C('7', '♣', 3), C('7', '♦', 4),
+    C('K', '♠', 5), C('K', '♥', 6), C('K', '♣', 7), C('K', '♦', 8), C('3', '♠', 9)];
+  const round = makeRound('9', [myHand, [C('3', '♠', 90)], [C('4', '♠', 91)], [C('6', '♠', 92)]]);
+  const t = [C('5', '♠', 60)];
+  const best = { cards: t, it: bestInterpretation(t, '9'), by: 1 };
+  const ctx = buildCtx(round, 0, best);
+  const { facts } = prepareDecision(ctx);
+  assert.equal(facts.soleBomb, false, '两手炸不算soleBomb');
 });
