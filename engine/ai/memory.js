@@ -99,9 +99,13 @@ export class RoundMemory {
 
     const lines = [];
     if (this.summary) lines.push(this.summary);
-    lines.push(`第${seg[0].n}~${seg[seg.length - 1].n}手摘要：`
-      + [0, 1, 2, 3].map(s => `座${s}出${byCount[s]}手/过${byPass[s]}次`
-        + (Object.keys(shapes[s]).length ? '(' + Object.entries(shapes[s]).map(([k, v]) => SHAPE_CN[k] + v).join(' ') + ')' : '')).join('；'));
+    // 全零段(该区间没有任何出牌/过牌)不生成摘要行——之前产生大量"座0出0手/过0次"垃圾行
+    const hasAny = byCount.some(n => n > 0) || byPass.some(n => n > 0) || notable.length;
+    if (hasAny) {
+      lines.push(`第${seg[0].n}~${seg[seg.length - 1].n}手摘要：`
+        + [0, 1, 2, 3].map(s => `座${s}出${byCount[s]}手/过${byPass[s]}次`
+          + (Object.keys(shapes[s]).length ? '(' + Object.entries(shapes[s]).map(([k, v]) => SHAPE_CN[k] + v).join(' ') + ')' : '')).join('；'));
+    }
     if (notable.length) lines.push('关键事件：' + notable.slice(-8).join('；'));
 
     let out = lines.join('\n');

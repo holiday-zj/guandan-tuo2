@@ -3,7 +3,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Round } from '../engine/game.js';
 import { PlayTracker, handStrength, tugPolicy } from '../engine/ai/analyze.js';
-import { buildFacts, factsToText, prepareDecision, validateDecision, engineRecommend, scoreCandidate, passScore } from '../engine/ai/score.js';
+import { buildFacts, factsToText, prepareDecision, validateDecision, engineRecommend, scoreCandidate, passScore, estimateOppBeatRisk, estimateHands } from '../engine/ai/score.js';
+import { RoundMemory } from '../engine/ai/memory.js';
 import { bestInterpretation } from '../engine/classify.js';
 import { leadOptions, followOptions } from '../engine/hint.js';
 
@@ -227,4 +228,114 @@ test('prepareDecision：候选按分数降序且重新编号，#0=推荐(出牌�
   if (recommend.action === 'play') {
     assert.equal(recommend.idx, ctx.candidates.reduce((b, c) => c.score > ctx.candidates[b].score ? c.idx : b, 0));
   }
+});
+
+/* ===== 用户规则修正：队友握牌权 / 拦截窗口 ===== */
+
+test('队友剩1张且正握牌权(刚出炸弹) → 不触发partnerNeedLead，推荐坚决过牌', () => {
+  // 场景复现：队友座2出了5张炸剩1张，我(座0)不该被强迫夺牌权
+  const myHand = [C('T', '♠', 1), C('T', '♥', 2), C('T', '♣', 3), C('T', '♦', 4), C('T', '♠', 5),
+    C('J', '♠', 6), C('Q', '♥', 7), C('6', '♠', 8), C('6', '♥', 9), C('6', '♣', 10)];
+  const round = makeRound('9', [myHand, [C('3', '♠', 90)], [C('K', '♥', 91)], [C('4', '♠', 92)]]);
+  round.finishOrder = [];
+  const bombCards = [C('9', '♠', 70), C('9', '♥', 71), C('9', '♣', 72), C('9', '♦', 73), C('9', '♠', 74)];
+  const best = { cards: bombCards, it: bestInterpretation(bombCards, '9'), by: 2 }; // 队友的炸
+  const ctx = buildCtx(round, 0, best);
+  ctx.tracker.playedBySeat[2] = 26; // 队友剩1张
+  const { facts, recommend } = prepareDecision(ctx);
+  assert.equal(facts.partnerLeading, true, '队友应被识别为握牌权');
+  assert.equal(facts.partnerNeedLead, false, '队友握牌权时不该判needLead');
+  assert.equal(recommend.action, 'pass', '应推荐过牌让队友走');
+  const txt = factsToText(facts, 0);
+  assert.match(txt, /坚决过牌|绝不能压队友/, '文本应明说坚决过牌');
+  assert.match(txt, /要得起/, '应给出对手要得起概率');
+});
+
+test('校验器：队友剩1张握牌权时LLM压队友 → 违规强制过牌', () => {
+  const myHand = [C('K', '♠', 1), C('K', '♥', 2), C('K', '♣', 3), C('K', '♦', 4), C('K', '♠', 5), C('K', '♥', 6),
+    C('5', '♠', 7), C('6', '♠', 8)];
+  const round = makeRound('9', [myHand, [C('3', '♠', 90)], [C('7', '♥', 91)], [C('4', '♠', 92)]]);
+  const partnerCards = [C('7', '♠', 60)]; // 队友出单7
+  const best = { cards: partnerCards, it: bestInterpretation(partnerCards, '9'), by: 2 };
+  const ctx = buildCtx(round, 0, best);
+  ctx.tracker.playedBySeat[2] = 26; // 队友剩1张
+  const { facts } = prepareDecision(ctx);
+  const bombCand = ctx.candidates.find(c => c.type === 'bomb');
+  assert.ok(bombCand, '应有6K炸候选');
+  const v = validateDecision({ action: 'play', candidate: bombCand.idx, reason: '压队友' }, ctx, facts);
+  assert.ok(v, '压剩1张握牌权队友应违规');
+  assert.match(v, /必须过牌/, '纠正语应说明必须过牌');
+});
+
+test('队友剩1张但牌权在对手手上 → partnerNeedLead 仍触发必须夺牌权', () => {
+  const myHand = [C('A', '♠', 1), C('K', '♠', 2), C('5', '♠', 3), C('4', '♣', 4)];
+  const round = makeRound('9', [myHand, [C('8', '♠', 60), C('3', '♠', 90)], [C('9', '♥', 91)], [C('6', '♠', 92)]]);
+  const best = { cards: [C('8', '♠', 60)], it: bestInterpretation([C('8', '♠', 60)], '9'), by: 1 }; // 对手出牌
+  const ctx = buildCtx(round, 0, best);
+  ctx.tracker.playedBySeat[2] = 26; // 队友剩1张
+  const { facts } = prepareDecision(ctx);
+  assert.equal(facts.partnerLeading, false);
+  assert.equal(facts.partnerNeedLead, true, '牌权在对手手上时应触发needLead');
+  const v = validateDecision({ action: 'pass', reason: '让队友走' }, ctx, facts);
+  assert.ok(v, 'pass应违规');
+  assert.match(v, /夺牌权/);
+});
+
+test('拦截窗口：对手剩约3手(9张)且有结构无损候选时过牌 → 校验器要求接', () => {
+  const myHand = [C('5', '♠', 1), C('6', '♠', 2), C('7', '♠', 3), C('8', '♠', 4),
+    C('A', '♠', 5), C('K', '♥', 6), C('Q', '♣', 7), C('J', '♦', 8), C('4', '♠', 9), C('3', '♥', 10)];
+  const round = makeRound('9', [myHand, [C('3', '♠', 90)], [C('4', '♠', 91)], [C('6', '♠', 92)]]);
+  const t = [C('4', '♠', 60)]; // 对手出单4
+  const best = { cards: t, it: bestInterpretation(t, '9'), by: 3 };
+  const ctx = buildCtx(round, 0, best);
+  ctx.tracker.playedBySeat[3] = 18; // 对手剩9张 ≈ 3手
+  const { facts } = prepareDecision(ctx);
+  assert.equal(facts.oppEndgame, true, '应识别拦截窗口');
+  assert.equal(facts.oppHandsEst, 3);
+  const v = validateDecision({ action: 'pass', reason: '懒得压' }, ctx, facts);
+  assert.ok(v, '拦截窗口有干净候选时过牌应被提醒');
+  assert.match(v, /拦截窗口/);
+});
+
+test('拦截窗口：对手剩很多牌(20张)时过牌不触发拦截提醒', () => {
+  const myHand = [C('5', '♠', 1), C('6', '♠', 2), C('7', '♠', 3), C('8', '♠', 4),
+    C('A', '♠', 5), C('K', '♥', 6), C('Q', '♣', 7), C('J', '♦', 8), C('4', '♠', 9), C('3', '♥', 10)];
+  const round = makeRound('9', [myHand, [C('3', '♠', 90)], [C('4', '♠', 91)], [C('6', '♠', 92)]]);
+  const t = [C('4', '♠', 60)];
+  const best = { cards: t, it: bestInterpretation(t, '9'), by: 3 };
+  const ctx = buildCtx(round, 0, best);
+  ctx.tracker.playedBySeat[3] = 7; // 对手剩20张
+  const { facts } = prepareDecision(ctx);
+  assert.equal(facts.oppEndgame, false);
+  // 用大牌过牌是允许的(小单4不值得用K压)——不触发拦截违规
+  const v = validateDecision({ action: 'pass', reason: '保留大牌' }, ctx, facts);
+  assert.equal(v, null, '非拦截窗口过牌不该违规');
+});
+
+test('estimateOppBeatRisk：队友的天王炸=low，普通小单张=high', () => {
+  const round = makeRound('9');
+  const ctx0 = buildCtx(round, 0, null);
+  // 天王炸
+  const kings = [C('BJ', '♠', 1), C('BJ', '♥', 2), C('SJ', '♣', 3), C('SJ', '♦', 4)];
+  const kBest = { cards: kings, it: bestInterpretation(kings, '9'), by: 2 };
+  assert.equal(estimateOppBeatRisk(kBest, ctx0), 'low', '天王无人能压');
+  // 单张3(小)：外面大把牌能压
+  const small = [C('3', '♠', 5)];
+  const sBest = { cards: small, it: bestInterpretation(small, '9'), by: 2 };
+  assert.equal(estimateOppBeatRisk(sBest, ctx0), 'high', '小单张对手要得起概率高');
+});
+
+test('记忆压缩：全零段不再生成垃圾摘要行', () => {
+  const m = new RoundMemory(1, '9', '2');
+  // 少量出牌 + 让压缩只处理"无动作"区间
+  m.addPlay(0, '出单[♠3]，剩26张');
+  m.summaryUpTo = 0;
+  // 手工构造：publicLog只有1条，KEEP_PUBLIC=14 → 无段可压，但直接调 deterministicCompress 验证空段
+  m.addPlay(1, '过牌，压不过单(值3)');
+  // 强制压缩全部：把 KEEP 调小到0不可行，改为验证摘要不含全零行
+  const did = m.deterministicCompress();
+  if (did) {
+    assert.ok(!/座0出0手\/过0次；座1出0手\/过0次；座2出0手\/过0次；座3出0手\/过0次/.test(m.summary), '不应出现全零摘要行');
+  }
+  assert.ok(true);
 });

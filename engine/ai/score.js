@@ -3,7 +3,7 @@
 //   1. 引擎比 LLM 更清楚"事实"（谁告急/过牌后牌权归谁/能否清牌）——事实由代码算好钉进 prompt
 //   2. 候选按结构评分排序，最优者标 [★引擎推荐]，LLM 做选择题而非推理题
 //   3. LLM 输出过校验器：违反硬规则 → 带纠正提示重问一次 → 仍违规 → 引擎改判
-import { isWild, orderValue } from '../cards.js';
+import { isWild, orderValue, RANKS } from '../cards.js';
 import { beatScore } from '../classify.js';
 import { decompose } from './analyze.js';
 
@@ -43,6 +43,112 @@ export function annotateCandidates(candidates, hand, level, strength) {
 }
 
 /* ============ 2. 硬事实（引擎确定知道、不该让 LLM 推理的） ============ */
+
+// 组合数对数表（U≤108，直接预算）
+const LOGF = (() => { const a = [0, 0]; for (let i = 2; i <= 220; i++) a[i] = a[i - 1] + Math.log(i); return a; })();
+// 超几何概率 P(X>=k)：从 U 张未知牌中，某对手抓 h 张，其中特定点数有 n 张，抓到≥k张的概率
+function hyperTail(n, k, h, U) {
+  if (n <= 0 || h <= 0 || U <= 0 || k <= 0) return k <= 0 ? 1 : 0;
+  const maxI = Math.min(n, h);
+  const minI = Math.max(k, h - (U - n));
+  if (minI > maxI) return 0;
+  const logDenom = LOGF[U] - LOGF[h] - LOGF[U - h];
+  let p = 0;
+  for (let i = minI; i <= maxI; i++) {
+    const logTerm = (LOGF[n] - LOGF[i] - LOGF[n - i]) + (LOGF[U - n] - LOGF[h - i] - LOGF[U - n - h + i]) - logDenom;
+    p += Math.exp(logTerm);
+  }
+  return Math.min(1, p);
+}
+
+/**
+ * 估算对手要得起队友这手牌的概率：'low'|'mid'|'high'
+ * 基于算牌(remainingOutside)+各家剩余张数的超几何分布，逐对手计算（炸弹不会跨两家拼）
+ */
+export function estimateOppBeatRisk(best, ctx) {
+  const { level, tracker, hand, round, seat } = ctx;
+  if (!best || !best.it || !tracker) return 'mid';
+  const it = best.it;
+  const bs = beatScore(it);
+  if (bs[0] >= 9) return 'low'; // 天王无人能压
+  const remaining = tracker.remainingOutside(hand);
+  const U = Object.values(remaining).reduce((a, b) => a + b, 0);
+  const partner = (seat + 2) % 4;
+  const finished = round.finishOrder || [];
+  const hc = tracker.handCounts();
+  const oppHands = [];
+  for (let s = 0; s < 4; s++) {
+    if (s === seat || s === partner || finished.includes(s)) continue;
+    const n = hc[s] || 0;
+    if (n > 0) oppHands.push(n);
+  }
+  if (!U || !oppHands.length) return 'mid';
+  const classify = p => (p < 0.15 ? 'low' : p < 0.5 ? 'mid' : 'high');
+  // 单家对手持有某点数≥k张的概率（各对手独立算后相加，封顶0.95）
+  const pRank = (rank, k) => {
+    const n = remaining[rank] || 0;
+    if (n < k) return 0;
+    let p = 0;
+    for (const h of oppHands) p += hyperTail(n, k, h, U);
+    return Math.min(0.95, p);
+  };
+  const ALL_RANKS = [...RANKS, 'SJ', 'BJ'];
+
+  if (bs[0] >= 6) {
+    // —— 炸弹类 ——
+    const len = it.len || (it.cards ? it.cards.length : 4);
+    let pNot = 1;
+    if (bs[0] === 7) {
+      // 同花顺：被6+张炸或天王压
+      for (const rank of RANKS) pNot *= (1 - pRank(rank, 6));
+    } else {
+      // 普通炸弹：被更长炸 / 同长更大点数炸 压
+      for (const rank of RANKS) {
+        const pLonger = pRank(rank, len + 1);
+        let pr = pLonger;
+        if (orderValue(rank, level) > (it.value || 0)) {
+          pr += Math.max(0, pRank(rank, len) - pLonger); // 恰好len张且更大
+        }
+        pNot *= (1 - Math.min(0.95, pr));
+      }
+    }
+    // 天王(4王)
+    const pKings = Math.min(0.9, pRank('BJ', 2) * 1.2) * Math.min(0.9, pRank('SJ', 2) * 1.2);
+    pNot *= (1 - Math.min(0.5, pKings));
+    // 同花顺可压4/5张炸（粗估概率）
+    if (bs[0] === 6 && len <= 5) pNot *= (1 - 0.12);
+    return classify(1 - pNot);
+  }
+
+  // —— 普通牌型 ——
+  const v = bs[2] || it.value || 0;
+  if (['straight', 'pair_straight', 'triple_straight'].includes(it.type)) {
+    // 长牌型难凑：数外面更大点数的可用性，粗估
+    const need = it.cards ? it.cards.length : 5;
+    let threats = 0;
+    for (const rank of ALL_RANKS) {
+      if (orderValue(rank, level) <= v) continue;
+      if ((remaining[rank] || 0) >= Math.ceil(need / 2)) threats++;
+    }
+    return threats === 0 ? 'low' : threats <= 2 ? 'mid' : 'high';
+  }
+  // 单/对/三张/三带二：需要更大点数的 k 张
+  const k = it.type === 'single' ? 1 : it.type === 'pair' ? 2 : 3;
+  let pNot = 1;
+  for (const rank of ALL_RANKS) {
+    if (orderValue(rank, level) <= v) continue;
+    pNot *= (1 - pRank(rank, k));
+  }
+  return classify(1 - pNot);
+}
+
+// 估算某家剩余手牌的"手数"（未知手牌只能按张数粗估：平均一手4张）
+export function estimateHands(n) {
+  if (n <= 0) return 0;
+  if (n <= 3) return 1;
+  return Math.max(1, Math.ceil(n / 4));
+}
+
 export function buildFacts(ctx) {
   const { hand, best, seat, round, tracker, driver, strength } = ctx;
   const partner = (seat + 2) % 4;
@@ -50,28 +156,48 @@ export function buildFacts(ctx) {
   const active = s => !finished.includes(s);
   const hc = tracker ? tracker.handCounts() : (round.hands || []).map(h => (h ? h.length : 0));
 
+  // 队友是否正持有当前牌圈牌权（他刚出的牌还没被人压）——此时他不需要"夺牌权"
+  const partnerLeading = !!(best && best.by === partner && active(partner));
+
   const facts = {
     isLead: !best,
     byPartner: best ? best.by === partner : false,
+    partnerLeading,
     partnerDone: finished.includes(partner),
     partnerRemaining: hc[partner] ?? 0,
-    // 队友只剩1张且未出完：必须夺牌权再送小牌（送他走）
-    partnerNeedLead: active(partner) && (hc[partner] ?? 99) <= 1,
-    partnerUrgent: active(partner) && (hc[partner] ?? 99) <= 2,
+    // 队友只剩1张且牌权在对手手上：必须夺牌权再送小牌（送他走）
+    // ⚠ 队友自己正在领牌(如刚出炸弹)时不适用——三家不要他就继续走，过牌即可
+    partnerNeedLead: active(partner) && (hc[partner] ?? 99) <= 1 && !partnerLeading,
+    partnerUrgent: active(partner) && (hc[partner] ?? 99) <= 2 && !partnerLeading,
+    partnerBeatRisk: 'mid',   // 队友这手牌对手要得起的风险（estimateOppBeatRisk）
+    partnerBigPlay: false,    // 队友出的是炸弹类
     myHands: strength ? strength.hands : 99,
     sprint: hand.length <= 5 || (strength ? strength.hands <= 2 : false),
     canWinAll: false, winAllIdx: -1,
     oppUrgentNow: false, oppUrgentNowSeat: -1, oppUrgentNowCount: 0,
     oppLastCard: false,   // 牌圈主只剩≤1张：这手不压他就走
+    oppEndgame: false,    // 牌圈主(对手)估计≤3手：拦截窗口，结构无损就该接
+    oppHandsEst: 99,
     anyOppUrgent: false,
   };
+
+  if (best && facts.byPartner) {
+    facts.partnerBeatRisk = estimateOppBeatRisk(best, ctx);
+    const bs = beatScore(best.it);
+    facts.partnerBigPlay = bs[0] >= 6;
+  }
 
   // 当前牌圈主打者告急判定
   if (best && active(best.by)) {
     const n = hc[best.by] ?? 99;
     facts.oppUrgentNowCount = n;
-    if (best.by !== partner && n <= 3) { facts.oppUrgentNow = true; facts.oppUrgentNowSeat = best.by; }
-    if (best.by !== partner && n <= 1) facts.oppLastCard = true;
+    if (best.by !== partner) {
+      facts.oppHandsEst = estimateHands(n);
+      if (n <= 3) { facts.oppUrgentNow = true; facts.oppUrgentNowSeat = best.by; }
+      if (n <= 1) facts.oppLastCard = true;
+      // 拦截窗口：对手估计只剩≤3手（且未到"必压"级），该接就接
+      if (facts.oppHandsEst <= 3) facts.oppEndgame = true;
+    }
   }
   for (let s = 0; s < 4; s++) {
     if (s === seat || s === partner || !active(s)) continue;
@@ -105,19 +231,33 @@ export function buildFacts(ctx) {
 
 // 把硬事实渲染成 prompt 文本（简短、结论式，不让模型自己推）
 export function factsToText(facts, seat) {
+  const RISK_CN = { low: '低(对手大概率要不起)', mid: '中', high: '高(对手很可能压得住)' };
   const L = [];
   if (facts.isLead) {
     L.push('【局面】你领出（本圈第一家）。');
   } else if (facts.byPartner) {
     if (facts.partnerDone) L.push('【局面】这是队友出完前的最后一手！你过牌且其余家都不要 → 接风给你。能一手清牌就清，否则过牌等接风。');
-    else L.push(`【局面】这是队友的牌（队友还剩${facts.partnerRemaining}张）。默认不压让他走；只有你能一手清牌或你正冲刺(≤2手)才压。`);
+    else if (facts.partnerLeading) {
+      L.push(`【局面】队友刚出这手牌、正握着牌权（他还剩${facts.partnerRemaining}张）。三家都不要 → 他继续领出。`
+        + (facts.partnerRemaining <= 1 ? '他只剩1张：只要对手压不过，他下一手就直接走掉——坚决过牌，绝不能压队友！' : '默认过牌让他走。'));
+      L.push(`对手要得起这手牌的概率：${RISK_CN[facts.partnerBeatRisk] || '中'}。`
+        + (facts.partnerBigPlay ? '这是炸弹级大牌，别接。' : facts.partnerBeatRisk === 'low' ? '对手大概率接不上，不需要你保。' : ''));
+      if (facts.partnerRemaining <= 2 && facts.partnerBeatRisk === 'high' && !facts.partnerBigPlay) {
+        L.push('⚠队友快出完且对手很可能压他：若你压过后能改出小牌送他走(不破坏自己结构)，可考虑接过来保他；否则过牌。');
+      }
+    } else {
+      L.push(`【局面】这是队友的牌（队友还剩${facts.partnerRemaining}张）。默认不压让他走；只有你能一手清牌或你正冲刺(≤2手)才压。`);
+    }
   } else {
     L.push('【局面】这是对手的牌。');
+    if (facts.oppEndgame && !facts.oppUrgentNow) {
+      L.push(`🚧拦截窗口：牌圈主估计只剩约${facts.oppHandsEst}手牌(≤3手)。在不破坏自己结构(手数不增、不拆成型牌)的前提下要接，打乱他的出牌节奏；若接牌代价太大(拆牌/耗炸)才放过。`);
+    }
   }
   if (facts.oppLastCard) L.push(`🚨牌圈主只剩${facts.oppUrgentNowCount}张——这手放过去他就出完！必须压（炸弹/天王也值得），除非你压不住。`);
-  else if (facts.oppUrgentNow) L.push(`🚨牌圈主只剩${facts.oppUrgentNowCount}张，随时可能走掉：压制优先，别吝惜大牌。`);
-  if (facts.partnerNeedLead && !facts.byPartner) L.push(`🚨队友只剩${facts.partnerRemaining}张！你过牌他永远拿不到牌权。必须夺牌权（能压就压），夺到后领最小单张送他走。注意：过牌≠接风给他，接风只在"出完牌的人"最后一手三家都不要时才发生。`);
-  else if (facts.partnerUrgent && !facts.byPartner) L.push(`队友只剩${facts.partnerRemaining}张，考虑夺牌权送他。`);
+  else if (facts.oppUrgentNow && !facts.byPartner) L.push(`🚨牌圈主只剩${facts.oppUrgentNowCount}张，随时可能走掉：压制优先，别吝惜大牌。`);
+  if (facts.partnerNeedLead && !facts.byPartner) L.push(`🚨队友只剩${facts.partnerRemaining}张且牌权在对手手上！你过牌他永远拿不到牌权。必须夺牌权（能压就压），夺到后领最小单张送他走。注意：过牌≠接风给他，接风只在"出完牌的人"最后一手三家都不要时才发生。`);
+  else if (facts.partnerUrgent && !facts.byPartner) L.push(`队友只剩${facts.partnerRemaining}张(牌权不在他手上)，考虑夺牌权送他。`);
   if (!facts.isLead && facts.passEndsTrick) {
     if (facts.passWindsToMe) L.push('【过牌后果】你过牌后本圈结束 → 接风给你，你将领出。');
     else if (facts.passWindsToOpp) L.push('⚠【过牌后果】你过牌后本圈结束 → 对手队接风领出！别让对手白拿牌权，能压就压。');
@@ -176,16 +316,26 @@ export function scoreCandidate(c, ctx, facts) {
   const bs = beatScore(c.it) || [0, 0, 0];
   if (best) {
     // —— 跟牌 ——
-    if (facts.byPartner && !facts.partnerDone && !facts.sprint) s -= 900; // 压队友重罚
+    if (facts.byPartner && !facts.partnerDone) {
+      // 队友正握牌权且只剩1张(即将直接走掉)：无论我是否冲刺都坚决不压
+      if (facts.partnerLeading && facts.partnerRemaining <= 1 && !winAll) s -= 2000;
+      else if (!facts.sprint) {
+        s -= 900; // 压队友重罚
+        // 例外：队友快出完但对手很可能压他(高风险)且这手不是炸弹 → 保队友可轻罚
+        if (facts.partnerLeading && facts.partnerRemaining <= 2 && facts.partnerBeatRisk === 'high' && !facts.partnerBigPlay) s += 700;
+      }
+    }
     if (HARD_TYPES.includes(c.type)) {
-      s -= mustBeat ? 10 : urgent ? 60 : 160; // 炸类：必须压时用，平时昂贵
+      s -= mustBeat ? 10 : urgent ? 60 : facts.oppEndgame ? 100 : 160; // 炸类：必须压时用，拦截期中等，平时昂贵
     } else {
       const v = bs[2] || 0;
-      s -= v * (mustBeat ? 0.5 : urgent ? 1 : 2.5); // 能小压不大压
-      if (v >= 15 && !urgent && !mustBeat) s -= 25;  // 级牌/王/A 压普通牌额外罚
+      s -= v * (mustBeat ? 0.5 : urgent ? 1 : facts.oppEndgame ? 1.8 : 2.5); // 能小压不大压
+      if (v >= 15 && !urgent && !mustBeat && !facts.oppEndgame) s -= 25;  // 级牌/王/A 压普通牌额外罚
     }
     if (urgent) s += 110;
     if (mustBeat) s += 130;
+    // 拦截窗口：对手估计≤3手，结构无损(dh≤0且无拆牌)的候选加分去接
+    if (facts.oppEndgame && !facts.byPartner && after && after.dh <= 0 && !after.breaks.length && !HARD_TYPES.includes(c.type)) s += 70;
     if (facts.passWindsToMe) s -= 30;             // 过牌接风给我 → 过牌也是好选择
     else if (facts.passWindsToOpp) s += 45; // 过牌会送对手接风 → 出牌加分
     else if (facts.passEndsTrick && facts.passNextIsPartner) s -= 40; // 过牌正好送队友牌权 → 出牌减分
@@ -205,10 +355,16 @@ export function scoreCandidate(c, ctx, facts) {
 // pass 的等价分数（跟牌时与候选最高分比较）
 // 基线取负值：掼蛋常规应"能小压就小压"顶掉对手小牌，只有代价过高(拆牌/A级牌王/炸)才过
 export function passScore(ctx, facts) {
-  if (facts.byPartner) return facts.partnerDone ? 600 : 500; // 队友的牌默认过
+  if (facts.byPartner) {
+    if (facts.partnerDone) return 600;
+    // 队友正握牌权且只剩1张：过牌让他直接走，坚决过
+    if (facts.partnerLeading && facts.partnerRemaining <= 1) return 1500;
+    return 500;
+  }
   let s = -20; // 基线：小牌跟小牌(得分≈-10)应该出，大牌/拆牌(得分<-20)才过
   if (facts.oppLastCard) s -= 500;
   else if (facts.oppUrgentNow) s -= 420;
+  else if (facts.oppEndgame) s -= 100; // 拦截窗口：对手≤3手，倾向去接
   if (facts.partnerNeedLead) s -= 400;
   if (facts.passWindsToMe) s += 220;              // 过牌接风给我，很好
   else if (facts.passWindsToOpp) s -= 180;        // 过牌送对手队接风，很亏
@@ -237,8 +393,12 @@ export function engineRecommend(ctx, facts) {
   if ((facts.oppUrgentNow || facts.partnerNeedLead) && top) {
     return { action: 'play', idx: top.idx, score: top.score, hard: 'must-beat' };
   }
-  if (facts.byPartner && !facts.partnerDone && !facts.sprint) {
-    return { action: 'pass', score: ps, hard: 'partner-lead' };
+  if (facts.byPartner && !facts.partnerDone) {
+    // 队友握牌权且只剩1张：即使我冲刺也过牌（他先走=我方头游）
+    if (facts.partnerLeading && facts.partnerRemaining <= 1) {
+      return { action: 'pass', score: ps, hard: 'partner-last-card' };
+    }
+    if (!facts.sprint) return { action: 'pass', score: ps, hard: 'partner-lead' };
   }
   if (top && top.score > ps) return { action: 'play', idx: top.idx, score: top.score };
   return { action: 'pass', score: ps };
@@ -257,11 +417,22 @@ export function validateDecision(d, ctx, facts) {
       if (candidates.length) return `牌圈主只剩${facts.oppUrgentNowCount}张随时出完，你有${candidates.length}个合法候选却过牌——必须压制`;
     }
     if (facts.partnerNeedLead && candidates.length) {
-      return `队友只剩${facts.partnerRemaining}张急需牌权，过牌他永远走不了——必须夺牌权（注意：此时过牌不是接风，接风只发生在"已出完牌的人"的最后一手三家都不要时）`;
+      return `队友只剩${facts.partnerRemaining}张且牌权在对手手上，过牌他永远走不了——必须夺牌权（注意：此时过牌不是接风，接风只发生在"已出完牌的人"的最后一手三家都不要时）`;
+    }
+    // 拦截窗口：对手估计≤3手，有结构无损的候选却过牌 → 该接不接
+    if (facts.oppEndgame && !facts.byPartner && candidates.length) {
+      const clean = candidates.filter(c =>
+        c.after && c.after.dh <= 0 && !c.after.breaks.length &&
+        !HARD_TYPES.includes(c.type) && !c.cards.some(x => isWild(x, ctx.level)));
+      if (clean.length) {
+        const alt = clean.reduce((a, b) => (b.score > a.score ? b : a), clean[0]);
+        return `对手估计只剩约${facts.oppHandsEst}手牌(≤3手)进入拦截窗口，候选#${alt.idx}接牌不破坏你的结构，应该接住打乱他节奏——除非你有明确战术理由(留绝对控制/送队友)`;
+      }
     }
     if (/接风/.test(d.reason || '')) {
       // 声称"等接风"但引擎事实不支持：过牌不会把牌权给我/队友
-      const windOk = facts.passWindsToMe || (facts.passEndsTrick && facts.passNextIsPartner);
+      const windOk = facts.passWindsToMe || (facts.passEndsTrick && facts.passNextIsPartner)
+        || (facts.byPartner && facts.partnerLeading); // 队友握牌权，三家不要他继续领——说"让他走"合理
       if (!windOk && !(facts.byPartner && facts.partnerDone)) {
         return `你说"等接风"但事实是：${facts.passEndsTrick ? `过牌后牌权归${facts.passNextOwner}号位` : '过牌后本圈未结束，牌权不在你/队友手上'}。接风只在"已出完牌的人"的最后一手三家都不要时才发生，重新决策`;
       }
@@ -271,9 +442,20 @@ export function validateDecision(d, ctx, facts) {
   if (d.action === 'play') {
     const pick = candidates.find(c => c.idx === d.candidate);
     if (!pick) return `候选编号${d.candidate}不存在（合法编号0~${candidates.length - 1}）`;
-    // 压队友（非清牌非冲刺）
-    if (facts.byPartner && !facts.partnerDone && !facts.sprint && pick.cards.length !== hand.length) {
-      return '这是队友的牌且队友未出完，压队友浪费牌权——除非你能一手清牌，否则过牌';
+    // 压队友（非清牌）
+    if (facts.byPartner && !facts.partnerDone && pick.cards.length !== hand.length) {
+      // 队友握牌权且只剩1张：即使冲刺也不许压（他先走=我方头游）
+      if (facts.partnerLeading && facts.partnerRemaining <= 1) {
+        return `队友正握牌权且只剩${facts.partnerRemaining}张——对手压不过他这手牌的话，他下一手直接走掉(头游)。压队友=毁掉他的大牌，必须过牌！`;
+      }
+      if (!facts.sprint) {
+        // 例外：队友快出完但对手很可能压他(高风险小牌) → 允许接过牌权保队友
+        const guardPartner = facts.partnerLeading && facts.partnerRemaining <= 2
+          && facts.partnerBeatRisk === 'high' && !facts.partnerBigPlay;
+        if (!guardPartner) {
+          return '这是队友的牌且队友未出完，压队友浪费牌权——除非你能一手清牌，否则过牌';
+        }
+      }
     }
     const winAll = pick.cards.length === hand.length;
     const mustBeat = facts.oppLastCard || facts.oppUrgentNow || facts.partnerNeedLead;
