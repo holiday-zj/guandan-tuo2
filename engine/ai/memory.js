@@ -11,9 +11,9 @@
 //   4. 压缩只动"旧"内容，最近 N 条始终原样保留（近期细节对决策最有用）
 import { askJson } from './llm.js';
 
-const SOFT_LIMIT = Number(process.env.AI_MEMORY_CHARS || 2600);   // 触发压缩的字符数
-const KEEP_PUBLIC = Number(process.env.AI_MEMORY_KEEP_PUBLIC || 26); // 始终保留最近多少条公开出牌
-const KEEP_PLANS = Number(process.env.AI_MEMORY_KEEP_PLANS || 8);    // 始终保留自己最近多少条意图
+const SOFT_LIMIT = Number(process.env.AI_MEMORY_CHARS || 1400);   // 触发压缩的字符数（瘦身：决策相关信息密度优先，注意力不被稀释）
+const KEEP_PUBLIC = Number(process.env.AI_MEMORY_KEEP_PUBLIC || 14); // 始终保留最近多少条公开出牌
+const KEEP_PLANS = Number(process.env.AI_MEMORY_KEEP_PLANS || 4);    // 始终保留自己最近多少条意图
 const SUMMARY_LIMIT = 700;                                       // 摘要目标长度
 
 const SHAPE_CN = {

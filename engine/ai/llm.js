@@ -43,6 +43,16 @@ export function llmStatus() {
 
 export function reloadLlmConfig() { cfg = loadEnv(); return llmStatus(); }
 
+// 决策终局日志：每次机器人/提示的最终执行动作（含via与拦截信息），供 scripts/llm-audit.js 统计
+let decSeq = 0;
+export function logDecision(obj) {
+  if (process.env.LLM_IO_LOG === '0') return;
+  try {
+    const ts = new Date().toISOString().slice(0, 19).replace('T', ' ');
+    fs.appendFileSync(IO_LOG_FILE, `[${ts}] #d${(++decSeq).toString(36)} DECISION ${JSON.stringify(obj)}\n\n`);
+  } catch { /* 日志失败绝不能影响游戏 */ }
+}
+
 // 简易响应缓存：同样局面不重复调用（省钱省时间）
 const cache = new Map();
 const CACHE_MAX = 400;
@@ -81,6 +91,7 @@ function logIO(reqId, model, type, payload) {
       lines.push(String(payload.raw || '').trim());
       lines.push('----- PARSED（解析后实际执行）-----');
       lines.push(JSON.stringify(payload.parsed));
+      if (payload.audit) lines.push('----- AUDIT ----- ' + JSON.stringify(payload.audit));
       if (payload.usage) lines.push('----- TOKENS ----- ' + JSON.stringify(payload.usage));
     } else if (type === 'ERROR') {
       lines.push(`===== 调用失败 耗时${payload.ms}ms =====`);
@@ -144,7 +155,7 @@ export async function askJson(systemPrompt, userPrompt, opts = {}) {
     clearTimeout(timer);
     const raw = d?.choices?.[0]?.message?.content || '';
     const data = extractJson(raw);
-    logIO(reqId, model, 'RESPONSE', { ms: Date.now() - t0, raw, parsed: data, usage: d?.usage });
+    logIO(reqId, model, 'RESPONSE', { ms: Date.now() - t0, raw, parsed: data, audit: opts.audit || null, usage: d?.usage });
     if (!data) return { ok: false, ms: Date.now() - t0, raw, error: 'JSON_PARSE_FAILED' };
     if (cache.size >= CACHE_MAX) cache.delete(cache.keys().next().value);
     cache.set(ck, data);

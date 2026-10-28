@@ -399,8 +399,12 @@ export function describeTable(round, seat, tracker, strengths) {
       if (n !== undefined) key.push(`${rank === 'BJ' ? '大王' : rank === 'SJ' ? '小王' : rank === level ? '级牌' + level : rank === tug ? '拖牌' + tug : rank}×${n}`);
     }
     lines.push('外面剩余(三家合计)：' + key.join(' '));
-    const bombThreat = RANKS.filter(rk => remaining[rk] >= 4);
-    if (bombThreat.length) lines.push(`⚠ 对手可能成炸的点数：${bombThreat.join(',')}`);
+    // 成炸威胁只在中后盘(场上未见牌不多时)才有意义，避免开局全点数刷屏噪声
+    const totalUnseen = Object.values(remaining).reduce((a, b) => a + b, 0);
+    if (totalUnseen <= 40) {
+      const bombThreat = RANKS.filter(rk => remaining[rk] >= 4);
+      if (bombThreat.length) lines.push(`⚠ 对手可能成炸的点数：${bombThreat.join(',')}`);
+    }
   }
 
   // 过牌信号
@@ -427,7 +431,10 @@ export function describeTable(round, seat, tracker, strengths) {
       const heavy = Object.entries(sum.ranksPlayed).filter(([, n]) => n >= 3).map(([r, n]) => `${RANK_CN(r)}×${n}`);
       const neverPlayed = [];
       if (remaining) {
+        const seen = new Set();
         for (const rk of ['BJ', 'SJ', level, 'A', 'K', 'Q']) {
+          if (seen.has(rk)) continue; // level可能是A/K/Q，去重防"级牌Q/Q"重复
+          seen.add(rk);
           if (!sum.ranksPlayed[rk] && remaining[rk] > 0) neverPlayed.push(RANK_CN(rk) === rk ? (rk === level ? `级牌${rk}` : rk) : RANK_CN(rk));
         }
       }

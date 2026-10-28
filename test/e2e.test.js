@@ -88,6 +88,8 @@ function valueOf(c, level) {
 function decide(snap, seat) {
   const level = snap.level;
   const hand = snap.hand;
+  // 头游纯拖锁牌圈：不可压制，只能过（新AI常打成末手纯拖，此局面高频出现）
+  if (snap.locked) return { type: 'pass' };
   const sorted = hand.slice().sort((a, b) => valueOf(a, level) - valueOf(b, level));
   if (!snap.best) {
     // 首攻禁拖：本副第一手(led=false)且拖牌=最小点时，跳过纯拖牌单张

@@ -1,55 +1,41 @@
-// AI 出牌决策：LLM 主脑 + 启发式保底
+// AI 出牌决策：引擎评分锚定 + LLM 主脑 + 违规校验自纠 + 引擎改判保底
 // 设计原则：
 //   1. LLM 只能从"引擎枚举出的合法候选"中选择，绝不自由生成牌 → 永不出非法牌
-//   2. LLM 超时/失败/输出无效 → 自动降级为启发式决策，游戏不卡死
-//   3. 决策上下文 = 确定性代码算好的牌情(算牌/牌力/拖牌策略/团队局势) + 候选列表
+//   2. 引擎先算好一切"事实"（谁告急/过牌后牌权归谁/能否清牌）并给候选打分排序，
+//      LLM 做的是"带推荐的选择题"，不是"从2600字里自己找线索的推理题"
+//   3. LLM 输出过校验器：违反硬规则 → 带纠正提示重问一次 → 仍违规 → 引擎改判
+//   4. LLM 超时/失败 → 直接用引擎推荐（比旧启发式更强），游戏永不卡死
 import { bestInterpretation, canBeat, beatScore } from '../classify.js';
 import { leadOptions, followOptions } from '../hint.js';
 import { orderValue, isWild, isJoker, tugRank, tugValueOf, cardLabel } from '../cards.js';
 import { handStrength, tugPolicy, teamSituation, describeTable, PlayTracker, decompose } from './analyze.js';
-import { askJson } from './llm.js';
+import { prepareDecision, factsToText, validateDecision, engineRecommend, passScore, annotateCandidates } from './score.js';
+import { askJson, logDecision } from './llm.js';
 
-export const SYSTEM_PROMPT = `你是掼蛋（安徽拖2）顶级高手AI。你与对家是一队，目标是让你们队拿高分。
+export const SYSTEM_PROMPT = `你是掼蛋（安徽拖2）顶级高手AI。你与对家是一队，目标：让你们队本副拿高分。
 
-# 本玩法核心规则（与标准掼蛋不同，务必记住）
-- 每副牌独立结算，不存在升级。亮牌定级：本副打"级牌"，拖牌=最小点数（打2时拖3，其余拖2）
-- 积分规则：双上(头游+二游同队)+3级 / 一三+2级 / 一四+1级
-- 拖牌奖励：头游最后一手若为【纯拖牌】(全部是拖牌点数的单/对/三张/拖牌炸弹)，每张+1级，红桃拖牌每张+2级；双上时二游末手纯拖也计分
-- 头游末手纯拖牌不可被压制，强制接风给队友——这是巨大优势
-- 末游惩罚：末游手里每剩1张拖牌，给对方+1级；双下时三游+末游的剩余拖牌全算
-- 首攻(本副第一手)禁止出纯拖牌
-- 红桃级牌=逢人配，可配除大小王外任意牌；天王(4王)>6张炸>同花顺>5张炸>普通牌型
-- 顺子只到A为止(A可作1用于A2345)，不绕回2
+# 规则要点（与标准掼蛋不同）
+- 每副独立结算不升级。亮牌定级，拖牌=最小点数(打2时拖3，其余拖2)
+- 计分：双上(头游+二游同队)+3级 / 一三+2级 / 一四+1级
+- 头游末手若为纯拖牌(全部是拖牌点数)：每张+1级、红桃拖每张+2级，且不可被压、强制接风给队友
+- 末游手里每剩1张拖牌给对方+1级(双下时三游+末游全算)；首攻禁纯拖
+- 逢人配(红桃级牌)可配除大小王外任意牌；天王(4王)>6张炸>同花顺>5张炸>4张炸>普通牌型；顺子只到A(A2345可，不绕回2)
+- 接风只在"某家打完最后一手牌且其余三家都不要"时发生，牌权给其对家。【过牌后果】段已由引擎算好，以它为准，不要自己猜
 
-# 决策前必做的推演（最重要！）
-每个候选都标了"⟶出后"，说明出这手牌后你剩余手牌的结构变化。选牌前，先在脑中把候选打出去，看剩下的牌还好不好走：
-1. **手数优先**：出完后"手数"(把手牌全部打完需要的最少次数)越少越好。同样能应对当前牌圈时，永远选手数减少或不变、且不带⚠的那个。
-2. **绝不无谓拆牌**：手里有对子/三张/炸弹时，若某候选标了"⚠拆散[对2张用1]"这类警告，说明它把成型牌拆散了，会让剩下的牌变零散难走——除非有明确战术理由(残局冲刺/送队友)，否则不选拆牌候选。
-   - 典型错误：手里有"三个3"，候选里既有"单个3"又有"三个3整出"，无脑选单个3会把三张拆成2张散牌，手数不降反升。应优先整组出，或干脆留着当控制。
-3. **控制张是武器不是消耗品**：炸弹/同花顺/天王/大王标了"⚠消耗控制张"的，只有在压制告急对手、抢头游、或残局清牌时才动用。中前盘为压一手普通牌就上炸=亏。
-4. **逢人配(红桃级牌)极珍贵**：能配任意牌补成炸弹/同花顺/钢板。除非能一举奠定胜局，否则不要单独当小牌打掉。
+# 决策流程（按顺序检查，命中即停）
+1. 【局面】说你能一手清牌 → 出清牌候选(末手纯拖最佳，锁牌+计分)。
+2. 残局警报：🚨牌圈主/对手告急(剩牌≤3张) → 必须压制，不惜炸弹天王。压不住才过。
+3. 残局警报：🚨队友剩1~2张 → 必须夺牌权再送队友小牌(送队友走是残局第一要务)。记住：过牌≠接风给他，他拿不到牌权！
+4. 队友领出且未出完 → 默认过牌让他走；只有你能一手清牌或你正冲刺才压。
+5. 常规跟牌对手 → 从引擎推荐[★]开始考虑：能小压不大压；要用A/级牌/炸去压小牌且无任何警报 → 过牌保留实力。
+6. 领出 → 出结构无损的小散牌(手数减少的成型牌优先)，控制张和逢人配留作后手；拖牌按【策略】处理。
+7. 算牌：某点数外面已出光而你手里有 = 绝对控制，可放心先甩小牌把它留作稳赢后手。
 
-# 团队与算牌
-5. 【团队观念】队友(对家)出的牌默认不压，让他走。只有"你要冲头游"或"队友明显走不动需要你接风"时才压队友。
-   ⚠️【接风的真实条件，别搞错】接风只在"某家打完最后一手牌且其余三家都不要"时发生，牌权才给他的对家。
-   对手还在正常出牌、手里还有很多牌时，你过牌 → 牌权回到对手手上，队友拿不到牌权，绝不是"帮队友接风"！
-   所以：对手出牌且队友没出完时，你能压就该压（尤其队友只剩1张、急需牌权时，你必须夺回牌权再送他小牌）。
-6. 【推断队友手牌】看"各家出牌画像"：队友密集出过的点数他手里估计不多了；队友从没出过、而外面还有的大点数(如A/王/级牌)他可能捏着当后手。若判断队友能压住当前对手、或队友快走完了，你就过牌让路、或用大牌帮他清障。
-7. 【送队友】当队友只剩很少牌(尤其≤3张)且这手牌权能交到他手上时，优先出他压得住的小牌把牌权送给他，让他先走成头游/二游。
-8. 【算牌绝对控制】某点数外面已全部出光而你手里有→你是该点数的绝对控制，可放心先甩别的小牌，把它留作后手稳赢一手。
-
-# 残局（关键！最后关头别送对手）
-9. 对手只剩1~3张牌时：这是最高优先级。必须全力压制，能压就压(哪怕动用炸弹/天王)，绝不能让对手轻松走掉拿头游或凑成双上。此时"别浪费控制张"的原则让位于"拦住对手"。
-10. 对手牌少且当前是他领出小牌时，警惕他在"清最后一手"，你有大牌就顶上。
-11. 反过来，我方(你或队友)只剩很少牌时，目标是抢先出完：能一次清完就清完；最后一手尽量是纯拖牌(计分+头游锁牌)。
-
-# 拖牌时机
-12. 我方有望头游/二游 → 拖牌留到最后一手打纯拖(计分翻倍+头游锁牌)；此时别把拖牌夹在小牌里早早出掉。
-13. 我方牌力弱恐成末游 → 拖牌尽早甩出去(夹在顺子/三带二里出掉也算)，闷在手里=当末游给对方送分。
-
-# 出牌方式细节
-14. 领出：优先出最难处理的散牌(小单张/小对子)，把大牌型和成型牌留作后手控制；但同样要看出后手数，别为出散牌反而拆了成型牌。
-15. 跟牌：能小压不用大压，省着大牌；压不住且不必要时宁可过牌保留实力。
+# 候选使用规则（重要）
+- 候选已按引擎评分从高到低排列，#0标[★引擎推荐]。无明确战术理由不要偏离推荐。
+- 标注含义：⟶出后=出这手后剩余手牌结构变化(手数越少越好)；⚠拆散=破坏成型牌；⚠消耗控制张=用掉炸弹/同花顺/天王/逢人配。
+- 存在干净候选(无⚠且手数不增)时，绝不选⚠候选——除非战术理由：拦告急对手、送队友、末手纯拖、算牌确认的绝对控制。
+- 手数增加(增N!)的候选是坏棋，除非一手清牌否则不选。
 
 # 输出格式（严格JSON，不要其他文字）
 {"action":"play","candidate":<候选编号>,"reason":"<20字内理由>"}
@@ -80,7 +66,7 @@ function buildCandidates(hand, level, best, opts = {}) {
   return uniq;
 }
 
-function candidateLabel(c, level, tug, after) {
+function candidateLabel(c, level, tug, after, isRec = false) {
   const typeCn = {
     single: '单', pair: '对', triple: '三张', triple_pair: '三带二', straight: '顺子',
     pair_straight: '三连对', triple_straight: '钢板', bomb: '炸弹', straight_flush: '同花顺', kings: '天王',
@@ -90,47 +76,18 @@ function candidateLabel(c, level, tug, after) {
   const hasWild = c.cards.some(x => isWild(x, level)) ? '(配)' : '';
   let afterStr = '';
   if (after) {
-    // 结构变化：手数增减 + 拆掉了哪些成型牌 + 控制张是否被消耗
     const bits = [];
-    const dh = after.hands - after.baseHands;
-    if (dh < 0) bits.push(`手数${after.baseHands}→${after.hands}(减${-dh})`);
-    else if (dh > 0) bits.push(`手数${after.baseHands}→${after.hands}(增${dh}!)`);
+    if (after.dh < 0) bits.push(`手数${after.baseHands}→${after.hands}(减${-after.dh})`);
+    else if (after.dh > 0) bits.push(`手数${after.baseHands}→${after.hands}(增${after.dh}!)`);
     else bits.push(`手数不变(${after.hands})`);
     if (after.breaks.length) bits.push('⚠拆散[' + after.breaks.join(',') + ']');
     if (after.lostControls.length) bits.push('⚠消耗控制张[' + after.lostControls.join(',') + ']');
     afterStr = ' ⟶出后: ' + bits.join(' ');
   }
-  return `${c.idx}. ${typeCn} ${c.cards.map(cardLabel).join(' ')}${pureTug}${hasTug}${hasWild}${afterStr}`;
+  return `${isRec ? '★' : ''}${c.idx}. ${typeCn} ${c.cards.map(cardLabel).join(' ')}${pureTug}${hasTug}${hasWild}${afterStr}`;
 }
 
-// 预计算每个候选"出牌后"的手牌结构（相对基线的变化）
-function annotateCandidates(candidates, hand, level, strength) {
-  const base = strength.decompose;
-  const baseHands = strength.hands;
-  // 基线里的成型牌（对子及以上）：出牌把它们拆散 = 破坏结构
-  const baseCombos = base.combos.filter(c => c.cards.length >= 2);
-  for (const cand of candidates) {
-    const ids = new Set(cand.cards.map(x => x.id));
-    const rest = hand.filter(c => !ids.has(c.id));
-    if (!rest.length) { cand.after = { hands: 0, baseHands, breaks: [], lostControls: [] }; continue; }
-    const d2 = decompose(rest, level);
-    const breaks = [];
-    for (const combo of baseCombos) {
-      const used = combo.cards.filter(c => ids.has(c.id)).length;
-      if (used > 0 && used < combo.cards.length) breaks.push(combo.type + combo.cards.length + '张用' + used);
-      else if (used === combo.cards.length && combo.cards.length >= 3) breaks.push('整组' + combo.type);
-    }
-    const lostControls = [];
-    for (const ctrl of base.controls) {
-      const used = ctrl.cards.filter(c => ids.has(c.id)).length;
-      if (used > 0) lostControls.push(used === ctrl.cards.length ? ctrl.type + '(整用)' : ctrl.type + `(拆${used}/${ctrl.cards.length})`);
-    }
-    cand.after = { hands: d2.hands, baseHands, breaks: [...new Set(breaks)], lostControls: [...new Set(lostControls)] };
-  }
-  return candidates;
-}
-
-// ————— 启发式决策（LLM 降级保底，也用于压测）————
+// ————— 启发式决策（最后保底，也用于压测；有评分时优先 engineDecide）————
 export function heuristicDecide(ctx) {
   const { hand, level, tug, best, candidates, strength, policy, situation, tracker } = ctx;
   const PASS = { type: 'pass' };
@@ -143,21 +100,18 @@ export function heuristicDecide(ctx) {
 
     // 冲刺：手里全是拖牌(或≤2手) → 直接清牌
     if (strength.hands <= 2 && !isFirstLead) {
-      // 优先纯拖(锁牌计分)，其次最大牌型
       const pureTug = candidates.filter(c => c.cards.every(x => x.rank === tug));
       if (pureTug.length && hand.length <= 6) return play(pureTug[pureTug.length - 1]);
     }
 
-    // dump 策略：尽早甩拖牌——找含拖牌的候选优先出（首攻除外，首攻禁纯拖）
+    // dump 策略：尽早甩拖牌（首攻除外，首攻禁纯拖）
     if (policy.policy === 'dump') {
       const withTug = candidates.filter(c =>
         c.cards.some(x => x.rank === tug) &&
         !(isFirstLead && c.cards.every(x => x.rank === tug)));
       if (withTug.length) {
-        // 拖牌夹在大牌型里出掉最好（顺子/三带二/对子），其次小牌型
         const embedded = withTug.filter(c => !c.cards.every(x => x.rank === tug));
         const pick = (embedded.length ? embedded : withTug);
-        // 选张数多的（一次甩更多）
         pick.sort((a, b) => b.cards.length - a.cards.length || a.cards[0] && orderValue(a.cards[0].rank, level) - orderValue(b.cards[0].rank, level));
         return play(pick[0]);
       }
@@ -171,13 +125,11 @@ export function heuristicDecide(ctx) {
       !(isFirstLead && c.cards.some(x => x.rank === tug) && c.cards.length === 1 && c.cards[0].rank === tug));
     const pool = normal.length ? normal : candidates.filter(c => !['bomb', 'straight_flush', 'kings'].includes(c.type));
     if (!pool.length) return play(candidates[0]);
-    // keep 策略：避免出含拖的牌型，除非只剩含拖选项
     let filtered = pool;
     if (policy.policy === 'keep') {
       const noTug = pool.filter(c => !c.cards.some(x => x.rank === tug));
       if (noTug.length) filtered = noTug;
     }
-    // 优先小手数牌型(单/对/三张)，同型选最小
     const shapeRank = { single: 0, pair: 1, triple: 2, straight: 3, triple_pair: 4, pair_straight: 5, triple_straight: 6 };
     filtered.sort((a, b) => {
       const sa = shapeRank[a.type] ?? 9, sb = shapeRank[b.type] ?? 9;
@@ -190,151 +142,162 @@ export function heuristicDecide(ctx) {
   // —— 跟牌 ——
   if (!candidates.length) return PASS;
   const byPartner = best.by === ((ctx.seat + 2) % 4);
-
-  // 队友出的牌：默认不压（团队观念），除非队友已出完/我方能借机清牌
   if (byPartner) {
     const partnerDone = ctx.round.finishOrder.includes(best.by);
     const canDumpAll = candidates.some(c => c.cards.length === hand.length);
-    if (!partnerDone && !canDumpAll) {
-      // 特殊情况：policy=dump 且队友出的是小牌、我有含拖候选能顺手甩拖 → 也不压，
-      // 因为压队友会浪费牌权。直接过。
-      return PASS;
-    }
-    // 队友出完牌了 → 这圈结束就接风给我，此时若我能一手清牌则出
+    if (!partnerDone && !canDumpAll) return PASS;
     if (canDumpAll) return play(candidates.find(c => c.cards.length === hand.length));
   }
 
-  // 对手出的牌
   const opp = best.by;
   const oppRemaining = tracker ? tracker.handCounts()[opp] : 99;
   const oppUrgent = oppRemaining <= 3;
 
-  // 我能一手清牌 → 直接出完（若清完是头游且最后一手是纯拖 → 锁牌，最佳）
   const winAll = candidates.find(c => c.cards.length === hand.length);
   if (winAll) return play(winAll);
 
-  // 冲刺阶段（我≤5张）：能压就压，抢头游
   if (hand.length <= 5) {
     const pureTugWin = candidates.find(c => c.cards.every(x => x.rank === tug) && c.cards.length === hand.length);
-    if (pureTugWin) return play(pureTugWin); // 末手纯拖=锁牌+计分
+    if (pureTugWin) return play(pureTugWin);
     return play(candidates[0]);
   }
+  if (oppUrgent) return play(candidates[0]);
 
-  // 对手告急(≤3张)：必须压制，不惜炸弹
-  if (oppUrgent) {
-    // 选能压的最小牌（含炸）
-    return play(candidates[0]);
-  }
-
-  // 常规压制：不用炸/同花顺/天王压普通牌，除非我是绝对控制或对手牌少
   const soft = candidates.filter(c => !['bomb', 'straight_flush', 'kings'].includes(c.type));
   const hard = candidates.filter(c => ['bomb', 'straight_flush', 'kings'].includes(c.type));
-
-  // dump 策略：优先用"含拖"的候选压牌，顺便甩拖
   if (policy.policy === 'dump' && soft.length) {
     const withTug = soft.filter(c => c.cards.some(x => x.rank === tug) && !c.cards.every(x => x.rank === tug));
     if (withTug.length) return play(withTug[0]);
   }
-  // keep 策略：避免用纯拖压牌（除非能锁牌赢），也避免拆拖牌对子
   if (soft.length) {
     let pool = soft;
     if (policy.policy === 'keep') {
       const noTug = soft.filter(c => !c.cards.some(x => x.rank === tug));
       if (noTug.length) pool = noTug;
     }
-    // 不用逢人配去压普通牌（浪费万能张），除非别无选择
     const noWild = pool.filter(c => !c.cards.some(x => isWild(x, level)));
     if (noWild.length) pool = noWild;
-    // 若压这手牌要付出太大代价(用A/级牌压小牌)且对手不告急 → 可以过
     const cheapest = pool[0];
     if (cheapest && !oppUrgent) {
       const cost = beatScore(cheapest.it)[2] || 0;
       const targetVal = beatScore(best.it)[2] || 0;
-      // 对手出小牌(≤8)，我要用≥14的大牌压 → 不划算，过
       if (targetVal <= 8 && cost >= 14 && hand.length > 8) return PASS;
-      // 对手是对家下家(我下家)出的普通小牌，且我下家牌多 → 放他走，省牌
     }
     return play(cheapest);
   }
-  // 只剩炸弹类：对手不告急就过
   if (hard.length && (oppUrgent || hand.length <= 8)) return play(hard[0]);
   return PASS;
 }
 
-// ————— LLM 决策主入口（异步）————
+// ————— 引擎决策：评分层的直接结论（LLM 失败时的主保底，比启发式更强）————
+export function engineDecide(ctx) {
+  const rec = ctx.recommend || engineRecommend(ctx, ctx.facts || {});
+  if (rec.action === 'play') {
+    const c = ctx.candidates.find(x => x.idx === rec.idx);
+    if (c) {
+      return {
+        type: 'play', cards: c.cards.map(x => ({ id: x.id })),
+        via: 'engine', reason: c.scoreNotes || '引擎评分最优',
+        picked: candidateLabel(c, ctx.level, ctx.tug, c.after),
+      };
+    }
+  }
+  return { type: 'pass', via: 'engine', reason: '引擎判定过牌' };
+}
+
+// ————— LLM 决策主入口（异步）：锚定 + 校验自纠一次 + 引擎改判 —————
 export async function llmDecide(ctx, opts = {}) {
-  const { hand, level, tug, best, candidates, strength, policy, situation, seat, round, tracker } = ctx;
-  if (!candidates.length && best) {
-    return { type: 'pass', via: 'no-candidates' };
-  }
-  if (!candidates.length && !best) {
-    return { type: 'pass', via: 'no-candidates' }; // 理论上不会发生
-  }
+  const { hand, level, tug, best, candidates, strength, policy, seat, round, tracker } = ctx;
+  if (!candidates.length) return { type: 'pass', via: 'no-candidates' };
 
-  // 组装 prompt
+  // 引擎预处理：事实计算 + 候选打分排序 + 推荐（幂等，重复调用无害）
+  const { facts, recommend } = ctx.facts ? { facts: ctx.facts, recommend: ctx.recommend } : prepareDecision(ctx);
+
   const table = describeTable(round, seat, tracker, ctx.strengths);
-  // 为每个候选标注"出牌后"的结构变化（手数增减/拆牌警告/控制张消耗）——核心防拆牌信息
-  annotateCandidates(candidates, hand, level, strength);
-  const candLines = candidates.map(c => candidateLabel(c, level, tug, c.after)).join('\n');
-  const trickInfo = best
-    ? `当前牌圈：${best.by === (seat + 2) % 4 ? '队友' : '对手'}(${best.by}号位)出了【${best.cards.map(cardLabel).join(' ')}】(${best.it.type})`
-    : `轮到你【领出】(你是本圈第一个出牌)`;
-  const partnerName = best && best.by === (seat + 2) % 4 ? '（这是队友的牌！默认不压，除非能帮队友或你要冲牌）' : '';
-
-  // 残局警报：任何人剩牌≤5张都单独强调
-  const endgame = [];
-  const hc = tracker ? tracker.handCounts() : round.hands.map(h => (h ? h.length : 0));
-  for (let s = 0; s < 4; s++) {
-    if (s === seat || round.finishOrder.includes(s)) continue;
-    const rel = ((s - seat + 4) % 4);
-    const who = rel === 2 ? '队友' : rel === 1 ? '下家(对手)' : '上家(对手)';
-    if (hc[s] <= 5) endgame.push(`🚨${who}${s}只剩${hc[s]}张！${who === '队友' ? '考虑送牌帮他先走' : '他随时可能走掉，压制优先级最高'}`);
-  }
-  const endgameStr = endgame.length ? endgame.join('\n') : '';
-
-  // 对局记忆：早期回顾(已压缩) + 最近出牌流水 + 我自己此前的计划
+  const factsStr = factsToText(facts, seat);
+  const candLines = candidates.map(c =>
+    candidateLabel(c, level, tug, c.after, recommend.action === 'play' && recommend.idx === c.idx)).join('\n');
+  const recHint = recommend.action === 'play'
+    ? `[★引擎推荐 #${recommend.idx}]`
+    : '[★引擎推荐：过牌]';
   const memoryStr = ctx.memory ? ctx.memory.buildFor(seat) : '';
 
-  const user = `${table}
+  const user = `${factsStr}
 
-${memoryStr ? memoryStr + '\n\n' : ''}${endgameStr}
-${trickInfo}${partnerName}
-
-我的拖牌策略：${policy.policy}（${policy.reason}）
+${table}
+${memoryStr ? '\n' + memoryStr + '\n' : ''}
+【策略】拖牌：${policy.policy}（${policy.reason}）
 我的手牌(${hand.length}张，手数≈${strength.hands})：${hand.slice().sort((a, b) => orderValue(a.rank, level) - orderValue(b.rank, level)).map(cardLabel).join(' ')}
 
-合法候选（只能从中选，编号即答案；⟶出后 是该选择对剩余手牌结构的影响）：
+合法候选（已按引擎评分降序，只能从中选，编号即答案）${recHint}：
 ${candLines}
-${best ? '（也可以选择 pass 过牌）' : '（领出必须出牌，不能pass）'}
+${best ? '（也可以 pass 过牌，过牌后果见【过牌后果】）' : '（领出必须出牌，不能pass）'}
 
-请先评估各候选出后剩余结构（手数最少、不拆成型牌、不浪费控制张者优先），再结合当前各家剩牌数与出牌画像决定。以【当前局面】为准，此前的计划若已不适用就立刻改变，不要为了一致性而延续错误判断，输出JSON。`;
+按系统提示的决策流程核对【局面】和🚨警报，输出JSON。`;
 
-  const r = await askJson(SYSTEM_PROMPT, user, {
+  const askOpts = {
     fast: opts.fast,
     timeoutMs: opts.timeoutMs || 10000,
     temperature: 0.2,
     maxTokens: 200,
-  });
+    // 机器可读审计信息（写入 llm-io.log 的 AUDIT 行，供 scripts/llm-audit.js 统计）
+    audit: {
+      seat, isLead: !best,
+      byPartner: best ? best.by === (seat + 2) % 4 : null,
+      trickBy: best ? best.by : null,
+      oppUrgentNow: !!facts.oppUrgentNow, oppUrgentCount: facts.oppUrgentNowCount,
+      partnerNeedLead: !!facts.partnerNeedLead, partnerUrgent: !!facts.partnerUrgent,
+      partnerDone: !!facts.partnerDone,
+      passEndsTrick: !!facts.passEndsTrick, passNextOwner: facts.passNextOwner,
+      passWindsToOpp: !!facts.passWindsToOpp, passNextIsPartner: !!facts.passNextIsPartner,
+      canWinAll: !!facts.canWinAll, winAllIdx: facts.winAllIdx,
+      handCount: hand.length, myHands: strength.hands,
+      recAction: recommend.action, recIdx: recommend.idx ?? null,
+      passScore: best ? passScore(ctx, facts) : null,
+      candScores: candidates.map(c => [c.idx, c.score]),
+    },
+  };
 
+  // 第一次询问
+  let r = await askJson(SYSTEM_PROMPT, user, askOpts);
   if (!r.ok) {
-    const h = heuristicDecide(ctx);
-    return { ...h, via: 'heuristic-fallback', llmError: r.error };
+    return { ...engineDecide(ctx), via: 'engine-fallback', llmError: r.error };
   }
 
-  // 解析 LLM 选择
-  const d = r.data;
-  if (d.action === 'pass') {
-    if (!best) {
-      // 领出不能过 → 降级启发式
-      return { ...heuristicDecide(ctx), via: 'llm-invalid(lead-pass)' };
+  // 解析 + 校验；违规 → 带纠正提示重问一次（自纠）；仍违规 → 引擎改判
+  let d = r.data;
+  let violation = validateDecision(d, ctx, facts);
+  if (violation) {
+    const correction = `${user}
+
+⚠你刚才的决策【${JSON.stringify(d).slice(0, 150)}】违反规则：${violation}。
+请严格按照【局面】【过牌后果】和🚨警报重新决策，输出JSON。`;
+    const r2 = await askJson(SYSTEM_PROMPT, correction, { ...askOpts, audit: { ...askOpts.audit, retry: 1 }, timeoutMs: Math.max(4000, askOpts.timeoutMs / 2) });
+    if (r2.ok) {
+      const v2 = validateDecision(r2.data, ctx, facts);
+      if (!v2) {
+        d = r2.data;
+        violation = null;
+        return toAction(d, ctx, 'llm-corrected');
+      }
+      violation = v2;
     }
-    return { type: 'pass', via: 'llm', reason: d.reason };
+    // 自纠失败 → 引擎改判
+    return { ...engineDecide(ctx), via: 'engine-override', violation };
   }
-  const pick = candidates.find(c => c.idx === d.candidate);
-  if (!pick) {
-    return { ...heuristicDecide(ctx), via: 'llm-invalid(bad-candidate)' };
+  return toAction(d, ctx, 'llm');
+}
+
+function toAction(d, ctx, via) {
+  if (d.action === 'pass') {
+    return { type: 'pass', via, reason: d.reason };
   }
-  return { type: 'play', cards: pick.cards.map(x => ({ id: x.id })), via: 'llm', reason: d.reason, picked: candidateLabel(pick, level, tug) };
+  const pick = ctx.candidates.find(c => c.idx === d.candidate);
+  if (!pick) return { ...engineDecide(ctx), via: 'engine-override', violation: 'bad-candidate:' + d.candidate };
+  return {
+    type: 'play', cards: pick.cards.map(x => ({ id: x.id })), via, reason: d.reason,
+    picked: candidateLabel(pick, ctx.level, ctx.tug, pick.after),
+  };
 }
 
 // ————— 构造决策上下文（机器人决策与玩家提示共用同一套 AI 分析）—————
@@ -355,14 +318,12 @@ export function buildDecisionContext(session, seat, trackerMap) {
     return { type: 'play', cards: [{ id: pick.id }], via: 'emergency-lead' };
   };
 
-  // 本座位的追踪器
   const tracker = trackerMap && trackerMap[seat];
   if (tracker) {
     tracker.level = level; tracker.tug = tug;
     tracker.syncFinish(round.finishOrder);
   }
 
-  // 各家牌力（队友的牌力用已出牌推断，简化：只算自己+记录队友出牌特征）
   const strength = handStrength(hand, level, tracker);
   const strengths = { [seat]: strength };
 
@@ -385,7 +346,7 @@ export function buildDecisionContext(session, seat, trackerMap) {
   let legal = candidates;
   if (!best && !round.led) {
     legal = candidates.filter(c => !c.cards.every(x => x.rank === tug));
-    if (!legal.length) legal = candidates; // 极端情况兜底
+    if (!legal.length) legal = candidates;
   }
   // 锁定牌圈（头游纯拖）：只能过
   if (best && round.trick && round.trick.locked) {
@@ -394,10 +355,12 @@ export function buildDecisionContext(session, seat, trackerMap) {
 
   const ctx = {
     hand, level, tug, best, candidates: legal, strength, strengths,
-    policy, situation, seat, round, tracker,
+    policy, situation, seat, round, tracker, driver,
     memory: session.memory || null,
     isFirstLead: !round.led,
   };
+  // 引擎预处理：候选打分排序 + 硬事实 + 推荐（LLM锚定与校验都依赖它）
+  prepareDecision(ctx);
   return { ctx, early: null };
 }
 
@@ -405,7 +368,6 @@ export function buildDecisionContext(session, seat, trackerMap) {
 // 返回 {action, reason, options}：options 为候选牌（id列表数组，供客户端循环高亮）
 export async function hintAsync(session, seat, trackerMap, opts = {}) {
   const { ctx, early } = buildDecisionContext(session, seat, trackerMap);
-  // 无候选/锁牌圈等确定局面：直接返回结论，不调用大模型
   if (early) {
     const options = early.type === 'play' ? [early.cards] : [];
     return {
@@ -413,10 +375,9 @@ export async function hintAsync(session, seat, trackerMap, opts = {}) {
       options, via: early.via,
     };
   }
-  // 候选牌的 id 列表（客户端据此高亮/选中）
+  // 候选已按引擎评分降序 → options 本身就是"从优到劣"，即使 LLM 失败顺序也有意义
   const options = ctx.candidates.map(c => c.cards.map(x => ({ id: x.id })));
 
-  // 大模型推荐（超时/失败则用启发式结果，保证提示永远有值）
   const HARD_TIMEOUT = Number(process.env.HINT_LLM_TIMEOUT || 8000);
   try {
     const action = await Promise.race([
@@ -428,12 +389,11 @@ export async function hintAsync(session, seat, trackerMap, opts = {}) {
     return {
       action: action ? action.type : 'play',
       reason: action && action.reason ? action.reason : '',
-      // 首选放最前（大模型推荐），其余候选跟随，客户端可循环切换
       options: chosen ? [chosen[0], ...options.filter(o => o !== chosen[0])] : options,
-      via: action ? (action.via || 'llm') : 'heuristic-fallback',
+      via: action ? (action.via || 'llm') : 'engine-fallback',
     };
   } catch (e) {
-    const h = heuristicDecide(ctx);
+    const h = engineDecide(ctx);
     const chosen = h.type === 'play' && h.cards ? [h.cards] : null;
     return {
       action: h.type, reason: '',
@@ -443,7 +403,7 @@ export async function hintAsync(session, seat, trackerMap, opts = {}) {
   }
 }
 
-// ————— 统一入口：构造上下文 + LLM(带保底) —————
+// ————— 统一入口：构造上下文 + LLM(锚定+自纠) + 引擎保底 —————
 export async function decideAsync(session, seat, trackerMap, opts = {}) {
   const { ctx, early } = buildDecisionContext(session, seat, trackerMap);
   if (early) return early;
@@ -453,12 +413,20 @@ export async function decideAsync(session, seat, trackerMap, opts = {}) {
     if (session.memory && action && action.reason) {
       session.memory.addPlan(seat, action.reason);
     }
+    // 终局决策日志：供 scripts/llm-audit.js 统计实际执行动作与拦截率
+    try {
+      logDecision({
+        seat, via: action && action.via, type: action && action.type,
+        reason: action && action.reason, violation: action && action.violation,
+        cards: action && action.cards ? action.cards.map(c => c.id).length : 0,
+        picked: action && action.picked, rec: ctx && ctx.recommend,
+      });
+    } catch { /* 日志不影响游戏 */ }
     return action;
   };
 
-  // LLM 主决策（失败自动降级启发式，永不阻塞游戏）
-  // 双保险：除 askJson 内部超时外，这里再加一层硬性总超时——
-  // 任何原因（含未预见的挂起）超过 HARD_TIMEOUT 立即走启发式，牌局绝不卡死
+  // LLM 主决策（校验自纠一次，失败引擎改判，永不阻塞游戏）
+  // 双保险：除 askJson 内部超时外，这里再加一层硬性总超时
   const HARD_TIMEOUT = Number(process.env.BOT_LLM_TIMEOUT || 9000) + 3000;
   try {
     const action = await Promise.race([
@@ -466,11 +434,11 @@ export async function decideAsync(session, seat, trackerMap, opts = {}) {
       new Promise(resolve => setTimeout(() => resolve(null), HARD_TIMEOUT)),
     ]);
     if (!action) {
-      return rememberPlan({ ...heuristicDecide(ctx), via: 'hard-timeout-fallback' });
+      return rememberPlan({ ...engineDecide(ctx), via: 'engine-hard-timeout' });
     }
-    action.llm = true;
+    action.llm = /llm/.test(action.via || '');
     return rememberPlan(action);
   } catch (e) {
-    return rememberPlan({ ...heuristicDecide(ctx), via: 'exception-fallback', error: String(e.message || e) });
+    return rememberPlan({ ...engineDecide(ctx), via: 'engine-exception', error: String(e.message || e) });
   }
 }

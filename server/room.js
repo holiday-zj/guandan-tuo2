@@ -411,6 +411,7 @@ export class GameSession {
       hand: r.hands[seat] ? r.hands[seat].map(c => ({ id: c.id, suit: c.suit, rank: c.rank })) : [],
       handCounts: r.hands.map(h => (h ? h.length : 0)),
       turn: this.driver ? this.driver.turn : null,
+      locked: !!(r.trick && r.trick.locked),  // 头游纯拖锁牌圈：只能过牌（重连后客户端也需要知道）
       best: this.driver && this.driver.best
         ? {
             by: this.driver.best.by,
